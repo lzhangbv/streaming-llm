@@ -15,7 +15,7 @@ from transformers.models.llama.modeling_llama import (
 )
 import types
 
-__all__ = ["enable_llama_pos_shift_attention"]
+__all__ = ["enable_llama_pos_shift_attention", "enable_llama_pos_abs_attention", "enable_llama_pos_inf_attention", "enable_llama_kmeans_attention"]
 
 
 def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
@@ -27,7 +27,17 @@ def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
     x_embed = (x * cos) + (rotate_half(x) * sin)
     return x_embed
 
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
+    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
+    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
+    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
+# implement sliding window attention with relative position ids
 def llama_pos_shift_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -172,3 +182,505 @@ def enable_llama_pos_shift_attention(model):
             model._modules[name].forward = types.MethodType(
                 llama_pos_shift_attention_forward, model._modules[name]
             )
+
+# implement sliding window attention with absolute position ids
+def llama_pos_abs_attention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    bsz, q_len, _ = hidden_states.size()
+
+    if self.config.pretraining_tp > 1:
+        key_value_slicing = (
+            self.num_key_value_heads * self.head_dim
+        ) // self.config.pretraining_tp
+        query_slices = self.q_proj.weight.split(
+            (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
+        )
+        key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
+        value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+
+        query_states = [
+            F.linear(hidden_states, query_slices[i])
+            for i in range(self.config.pretraining_tp)
+        ]
+        query_states = torch.cat(query_states, dim=-1)
+
+        key_states = [
+            F.linear(hidden_states, key_slices[i])
+            for i in range(self.config.pretraining_tp)
+        ]
+        key_states = torch.cat(key_states, dim=-1)
+
+        value_states = [
+            F.linear(hidden_states, value_slices[i])
+            for i in range(self.config.pretraining_tp)
+        ]
+        value_states = torch.cat(value_states, dim=-1)
+
+    else:
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+    query_states = query_states.view(
+        bsz, q_len, self.num_heads, self.head_dim
+    ).transpose(1, 2)
+    key_states = key_states.view(
+        bsz, q_len, self.num_key_value_heads, self.head_dim
+    ).transpose(1, 2)
+    value_states = value_states.view(
+        bsz, q_len, self.num_key_value_heads, self.head_dim
+    ).transpose(1, 2)
+
+    # kv_seq_len for only cached tokens
+    kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        kv_seq_len += past_key_value[0].shape[-2]
+
+    # abs_kv_seq_len for all tokens
+    new_kv_seq_len = key_states.shape[-2]
+    if past_key_value is None:
+        self.abs_kv_seq_len = new_kv_seq_len
+    else:
+        self.abs_kv_seq_len += new_kv_seq_len
+    
+    # absolute position ids
+    position_ids = torch.arange(self.abs_kv_seq_len - new_kv_seq_len, self.abs_kv_seq_len, dtype=torch.long, device=key_states.device)
+    position_ids = position_ids.unsqueeze(0).view(-1, new_kv_seq_len)
+
+    cos, sin = self.rotary_emb(value_states, seq_len=self.abs_kv_seq_len)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+    if past_key_value is not None:
+        # reuse k, v, self_attention
+        key_states = torch.cat([past_key_value[0], key_states], dim=2)
+        value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+    past_key_value = (key_states, value_states) if use_cache else None
+
+    # repeat k/v heads if n_kv_heads < n_heads
+    key_states = repeat_kv(key_states, self.num_key_value_groups)
+    value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
+        self.head_dim
+    )
+
+    if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+        raise ValueError(
+            f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+            f" {attn_weights.size()}"
+        )
+
+    if attention_mask is not None:
+        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            )
+        attn_weights = attn_weights + attention_mask
+
+    # upcast attention to fp32
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query_states.dtype
+    )
+    attn_output = torch.matmul(attn_weights, value_states)
+
+    if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        raise ValueError(
+            f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+            f" {attn_output.size()}"
+        )
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+    if self.config.pretraining_tp > 1:
+        attn_output = attn_output.split(
+            self.hidden_size // self.config.pretraining_tp, dim=2
+        )
+        o_proj_slices = self.o_proj.weight.split(
+            self.hidden_size // self.config.pretraining_tp, dim=1
+        )
+        attn_output = sum(
+            [
+                F.linear(attn_output[i], o_proj_slices[i])
+                for i in range(self.config.pretraining_tp)
+            ]
+        )
+    else:
+        attn_output = self.o_proj(attn_output)
+
+    if not output_attentions:
+        attn_weights = None
+
+    return attn_output, attn_weights, past_key_value
+
+
+def enable_llama_pos_abs_attention(model):
+    for name, module in reversed(model._modules.items()):
+        if len(list(module.children())) > 0:
+            enable_llama_pos_abs_attention(
+                module,
+            )
+
+        if isinstance(module, LlamaAttention):
+            model._modules[name].forward = types.MethodType(
+                llama_pos_abs_attention_forward, model._modules[name]
+            )
+
+# implement dense attention with infinite pad position ids, e.g., [0, 0, ...., 0, 1, 2, ..., 255]
+def llama_pos_inf_attention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    bsz, q_len, _ = hidden_states.size()
+
+    if self.config.pretraining_tp > 1:
+        key_value_slicing = (
+            self.num_key_value_heads * self.head_dim
+        ) // self.config.pretraining_tp
+        query_slices = self.q_proj.weight.split(
+            (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
+        )
+        key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
+        value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+
+        query_states = [
+            F.linear(hidden_states, query_slices[i])
+            for i in range(self.config.pretraining_tp)
+        ]
+        query_states = torch.cat(query_states, dim=-1)
+
+        key_states = [
+            F.linear(hidden_states, key_slices[i])
+            for i in range(self.config.pretraining_tp)
+        ]
+        key_states = torch.cat(key_states, dim=-1)
+
+        value_states = [
+            F.linear(hidden_states, value_slices[i])
+            for i in range(self.config.pretraining_tp)
+        ]
+        value_states = torch.cat(value_states, dim=-1)
+
+    else:
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+    query_states = query_states.view(
+        bsz, q_len, self.num_heads, self.head_dim
+    ).transpose(1, 2)
+    key_states = key_states.view(
+        bsz, q_len, self.num_key_value_heads, self.head_dim
+    ).transpose(1, 2)
+    value_states = value_states.view(
+        bsz, q_len, self.num_key_value_heads, self.head_dim
+    ).transpose(1, 2)
+
+    kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        kv_seq_len += past_key_value[0].shape[-2]
+
+    start_size, recent_size = 1, 255
+    cache_size = start_size + recent_size
+    cos, sin = self.rotary_emb(value_states, seq_len=cache_size)
+
+    if past_key_value is not None:
+        # reuse k, v, self_attention
+        key_states = torch.cat([past_key_value[0], key_states], dim=2)
+        value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+    past_key_value = (key_states, value_states) if use_cache else None
+
+    ### infinite position ids
+    if kv_seq_len <= cache_size:
+        key_position_ids = torch.arange(kv_seq_len, dtype=torch.long, device=position_ids.device).unsqueeze(0)
+    else:
+        left_position_ids = torch.arange(start_size, dtype=torch.long, device=position_ids.device)
+        mid_position_ids = torch.zeros(kv_seq_len - cache_size, dtype=torch.long, device=position_ids.device).fill_(start_size-1)
+        #mid_position_ids = torch.zeros(kv_seq_len - cache_size, dtype=torch.long, device=position_ids.device).fill_(start_size)
+        right_position_ids = torch.arange(start_size, cache_size, dtype=torch.long, device=position_ids.device)
+        key_position_ids = torch.cat([left_position_ids, mid_position_ids, right_position_ids]).unsqueeze(0)
+    
+    new_position_ids = key_position_ids[:, -q_len:]
+    query_states = apply_rotary_pos_emb_single(query_states, cos, sin, new_position_ids)
+    key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
+    ###
+
+    # repeat k/v heads if n_kv_heads < n_heads
+    key_states = repeat_kv(key_states, self.num_key_value_groups)
+    value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
+        self.head_dim
+    )
+
+    if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+        raise ValueError(
+            f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+            f" {attn_weights.size()}"
+        )
+
+    if attention_mask is not None:
+        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            )
+        attn_weights = attn_weights + attention_mask
+
+    # upcast attention to fp32
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query_states.dtype
+    )
+    attn_output = torch.matmul(attn_weights, value_states)
+
+    if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        raise ValueError(
+            f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+            f" {attn_output.size()}"
+        )
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+    if self.config.pretraining_tp > 1:
+        attn_output = attn_output.split(
+            self.hidden_size // self.config.pretraining_tp, dim=2
+        )
+        o_proj_slices = self.o_proj.weight.split(
+            self.hidden_size // self.config.pretraining_tp, dim=1
+        )
+        attn_output = sum(
+            [
+                F.linear(attn_output[i], o_proj_slices[i])
+                for i in range(self.config.pretraining_tp)
+            ]
+        )
+    else:
+        attn_output = self.o_proj(attn_output)
+
+    if not output_attentions:
+        attn_weights = None
+
+    return attn_output, attn_weights, past_key_value
+
+def enable_llama_pos_inf_attention(model):
+    for name, module in reversed(model._modules.items()):
+        if len(list(module.children())) > 0:
+            enable_llama_pos_inf_attention(
+                module,
+            )
+
+        if isinstance(module, LlamaAttention):
+            model._modules[name].forward = types.MethodType(
+                llama_pos_inf_attention_forward, model._modules[name]
+            )
+
+# implement kmeans attention with absolute position ids
+def llama_kmeans_attention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    bsz, q_len, _ = hidden_states.size()
+
+    if self.config.pretraining_tp > 1:
+        key_value_slicing = (
+            self.num_key_value_heads * self.head_dim
+        ) // self.config.pretraining_tp
+        query_slices = self.q_proj.weight.split(
+            (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
+        )
+        key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
+        value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+
+        query_states = [
+            F.linear(hidden_states, query_slices[i])
+            for i in range(self.config.pretraining_tp)
+        ]
+        query_states = torch.cat(query_states, dim=-1)
+
+        key_states = [
+            F.linear(hidden_states, key_slices[i])
+            for i in range(self.config.pretraining_tp)
+        ]
+        key_states = torch.cat(key_states, dim=-1)
+
+        value_states = [
+            F.linear(hidden_states, value_slices[i])
+            for i in range(self.config.pretraining_tp)
+        ]
+        value_states = torch.cat(value_states, dim=-1)
+
+    else:
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+    query_states = query_states.view(
+        bsz, q_len, self.num_heads, self.head_dim
+    ).transpose(1, 2)
+    key_states = key_states.view(
+        bsz, q_len, self.num_key_value_heads, self.head_dim
+    ).transpose(1, 2)
+    value_states = value_states.view(
+        bsz, q_len, self.num_key_value_heads, self.head_dim
+    ).transpose(1, 2)
+
+    # add cluster sizes
+    value_states = torch.cat([value_states, torch.ones(bsz,self.num_heads, q_len,1).to(value_states)], dim=-1) 
+
+    # kv_seq_len for only cached tokens
+    kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        kv_seq_len += past_key_value[0].shape[-2]
+
+    # abs_kv_seq_len for all tokens
+    new_kv_seq_len = key_states.shape[-2]
+    if past_key_value is None:
+        self.abs_kv_seq_len = new_kv_seq_len
+    else:
+        self.abs_kv_seq_len += new_kv_seq_len
+    
+    # absolute position ids
+    position_ids = torch.arange(self.abs_kv_seq_len - new_kv_seq_len, self.abs_kv_seq_len, dtype=torch.long, device=key_states.device)
+    position_ids = position_ids.unsqueeze(0).view(-1, new_kv_seq_len)
+
+    cos, sin = self.rotary_emb(value_states, seq_len=self.abs_kv_seq_len)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+    if past_key_value is not None:
+        # reuse k, v, self_attention
+        key_states = torch.cat([past_key_value[0], key_states], dim=2)
+        value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+    # repeat k/v heads if n_kv_heads < n_heads
+    key_states = repeat_kv(key_states, self.num_key_value_groups)
+    value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
+        self.head_dim
+    )
+
+    if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+        raise ValueError(
+            f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+            f" {attn_weights.size()}"
+        )
+
+    if attention_mask is not None:
+        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            )
+        attn_weights = attn_weights + attention_mask
+
+    # upcast attention to fp32
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states)
+
+    # rescaling attention weight
+    count_states = value_states[:,:,:,-1].unsqueeze(-2).to(attn_weights)
+    true_value_states = value_states[:,:,:,:-1]
+    accum_attn_weights = attn_weights * count_states
+    attn_weights = attn_weights/accum_attn_weights.sum(dim=-1, keepdim=True)
+
+    attn_output = torch.matmul(attn_weights.to(true_value_states), true_value_states)
+    attn_output = attn_output.to(hidden_states.dtype)
+
+    if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        raise ValueError(
+            f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+            f" {attn_output.size()}"
+        )
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+    if self.config.pretraining_tp > 1:
+        attn_output = attn_output.split(
+            self.hidden_size // self.config.pretraining_tp, dim=2
+        )
+        o_proj_slices = self.o_proj.weight.split(
+            self.hidden_size // self.config.pretraining_tp, dim=1
+        )
+        attn_output = sum(
+            [
+                F.linear(attn_output[i], o_proj_slices[i])
+                for i in range(self.config.pretraining_tp)
+            ]
+        )
+    else:
+        attn_output = self.o_proj(attn_output)
+
+    if not output_attentions:
+        attn_weights = None
+
+    # kv cache compression
+    recent_size, cache_size = 256, 512
+    bs, num_head, sq_len, _ = key_states.size()
+    if sq_len >= cache_size: 
+        past_key = key_states[:,:,:-recent_size,:]
+        past_value = value_states[:,:,:-recent_size,:]
+        recent_key = key_states[:,:,-recent_size:,:]
+        recent_value = value_states[:,:,-recent_size:,:]
+        
+        # cluster past_kv into 1/gap size
+        gap = 2
+        key_kernel = past_key[:,:,0::gap, :]
+        kernel_num = key_kernel.shape[2]
+
+        for _ in range(5):
+            index = None
+            n = num_head // 8
+            for i in range(n):
+                dis = (past_key[:,8*i:8*(i+1),:,:].unsqueeze(3) - key_kernel[:,8*i:8*(i+1),:,:].unsqueeze(2)).norm(dim=-1)
+                _, index1 =  torch.min(dis, dim=-1) # [bs, head/8, seq], num in [0,seq/gap)
+                if index is not None:
+                    index = torch.cat([index, index1], dim=1)
+                else:
+                    index = index1
+            index =  F.one_hot(index, kernel_num) # [bs, head, seq, past_seq/gap]
+            index = index.transpose(-1, -2).to(past_key) # [bs, head, past_seq/gap, seq]
+            key_kernel = torch.matmul(index, past_key)/(index.sum(dim=-1, keepdim=True)+0.001)
+
+        past_key = key_kernel
+        past_value = torch.matmul(index.to(past_value), past_value)
+
+        key_states = torch.cat([past_key, recent_key], dim=2)
+        value_states = torch.cat([past_value, recent_value], dim=2)
+        #print("cache len after compresion:", key_states.shape[2], value_states.shape[2])
+
+    value_states = value_states.to(torch.float32)
+    past_key_value = (key_states, value_states) if use_cache else None    
+
+    return attn_output, attn_weights, past_key_value
+
+
+def enable_llama_kmeans_attention(model):
+    for name, module in reversed(model._modules.items()):
+        if len(list(module.children())) > 0:
+            enable_llama_kmeans_attention(
+                module,
+            )
+
+        if isinstance(module, LlamaAttention):
+            model._modules[name].forward = types.MethodType(
+                llama_kmeans_attention_forward, model._modules[name]
+            )
+

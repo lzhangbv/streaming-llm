@@ -1,6 +1,7 @@
 import torch
 import argparse
 from transformers import (
+    AutoConfig,
     AutoTokenizer,
     AutoModelForCausalLM,
 )
@@ -41,22 +42,31 @@ def parse_args():
     parser.add_argument("--start_size", type=int, default=1)
     parser.add_argument("--recent_size", type=int, default=255)
     parser.add_argument("--enable_pos_shift", action="store_true")
-
+    parser.add_argument("--enable_pos_abs", action="store_true")
+    parser.add_argument("--enable_pos_inf", action="store_true")
+    parser.add_argument("--enable_kmeans_attention", action="store_true")
+    parser.add_argument("--scaling_factor", type=float, default=0)
     parser.add_argument("--num_eval_tokens", type=int, default=None)
 
     args = parser.parse_args()
     return args
 
 
-def load(model_name_or_path):
+def load(model_name_or_path, factor=0):
     print(f"Loading model from {model_name_or_path} ...")
     # however, tensor parallel for running falcon will occur bugs
     tokenizer = AutoTokenizer.from_pretrained(
         model_name_or_path,
         trust_remote_code=True,
     )
+    config = AutoConfig.from_pretrained(model_name_or_path)
+    if factor > 0:
+        config.rope_scaling = {"type": "dynamic", "factor": factor}
+    #print(config)
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
+        config=config,
         device_map="auto",
         torch_dtype=torch.float16,
         trust_remote_code=True,

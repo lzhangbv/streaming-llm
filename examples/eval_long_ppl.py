@@ -10,10 +10,11 @@ from streaming_llm.utils import parse_args, load
 device = "cuda"
 
 args = parse_args()
+print(args)
 
 data = load_dataset(args.dataset_name, args.task, split=args.split)
 
-model, tokenizer = load(args.model_name_or_path)
+model, tokenizer = load(args.model_name_or_path, factor=args.scaling_factor)
 
 nlls = []
 loss_fn = CrossEntropyLoss(reduction="none")
@@ -42,6 +43,7 @@ else:
     kv_cache = None
 
 if args.enable_pos_shift:
+    assert args.enable_start_recent_kv_cache
     if "llama" in model.config.model_type:
         from streaming_llm.pos_shift.modify_llama import enable_llama_pos_shift_attention
 
@@ -62,7 +64,30 @@ if args.enable_pos_shift:
         pass
     else:
         raise ValueError(f"got {model.config.model_type}")
+elif args.enable_pos_abs:
+    assert args.enable_start_recent_kv_cache
+    if "llama" in model.config.model_type:
+        from streaming_llm.pos_shift.modify_llama import enable_llama_pos_abs_attention
 
+        enable_llama_pos_abs_attention(model)
+    else:
+        raise ValueError(f"got {model.config.model_type}")
+elif args.enable_pos_inf:
+    assert not args.enable_start_recent_kv_cache
+    if "llama" in model.config.model_type:
+        from streaming_llm.pos_shift.modify_llama import enable_llama_pos_inf_attention
+
+        enable_llama_pos_inf_attention(model)
+    else:
+        raise ValueError(f"got {model.config.model_type}")
+elif args.enable_kmeans_attention:
+    assert not args.enable_start_recent_kv_cache
+    if "llama" in model.config.model_type: 
+        from streaming_llm.pos_shift.modify_llama import enable_llama_kmeans_attention
+
+        enable_llama_kmeans_attention(model)
+    else:
+        raise ValueError(f"got {model.config.model_type}")
 
 os.makedirs(args.output_dir, exist_ok=True)
 f = open(f"{args.output_dir}/log.txt", "w")
@@ -104,7 +129,25 @@ for text in data["text"][: args.num_samples]:
 
 f.close()
 
+log_lens = [1, 128, 256, 257, 2048, 2049, 4096, 8192, 16384]
+log_lens = [item for item in log_lens if item <= args.num_eval_tokens]
+assert len(nlls) >= log_lens[-1]
+
+log_ppl = []
+for log_len in log_lens:    
+    ppl = torch.exp(torch.stack(nlls[:log_len]).mean())
+    log_ppl.append(ppl.item())
+
 ppl = torch.exp(torch.stack(nlls).mean())
 print(ppl.item())
-with open(f"{args.output_dir}/ppl.txt", "w") as f:
-    f.write(f"{ppl.item()}\n")
+
+logfile = os.path.join(args.output_dir, "ppl_sliding{}_start{}_recent{}_posShift{}_posAbs{}_NTK{}.log".format(args.enable_start_recent_kv_cache, 
+        args.start_size, args.recent_size, args.enable_pos_shift, args.enable_pos_abs, args.scaling_factor))
+
+
+#with open(f"{args.output_dir}/ppl.txt", "w") as f:
+#    f.write(f"{ppl.item()}\n")
+
+with open(logfile, "w") as f:
+    for i in range(len(log_lens)):
+        f.write(f"input length: {log_lens[i]:.0f}, ppl: {log_ppl[i]:.2f}\n")
