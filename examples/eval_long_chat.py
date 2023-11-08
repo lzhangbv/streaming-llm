@@ -1,0 +1,239 @@
+import torch
+from tqdm import tqdm
+import os
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset
+from torch.nn import CrossEntropyLoss
+from streaming_llm.kv_cache import StartRecentKVCache
+from streaming_llm.utils import parse_args, load
+
+device = "cuda"
+
+args = parse_args()
+print(args)
+
+model, tokenizer = load(args.model_name_or_path, factor=args.scaling_factor)
+past_key_values = None
+
+if args.enable_start_recent_kv_cache:
+    if "llama" in model.config.model_type:
+        k_seq_dim = v_seq_dim = 2
+    elif "mpt" in model.config.model_type:
+        v_seq_dim = 2
+        k_seq_dim = 3
+    elif "pythia" in model.config.model_type:
+        k_seq_dim = v_seq_dim = 2
+    elif "falcon" in model.config.model_type:
+        v_seq_dim = 1
+        k_seq_dim = 1
+    else:
+        raise ValueError(f"got {model.config.model_type}")
+    kv_cache = StartRecentKVCache(
+        start_size=args.start_size,
+        recent_size=args.recent_size,
+        k_seq_dim=k_seq_dim,
+        v_seq_dim=v_seq_dim,
+    )
+else:
+    kv_cache = None
+
+if args.enable_pos_shift:
+    assert args.enable_start_recent_kv_cache
+    if "llama" in model.config.model_type:
+        from streaming_llm.pos_shift.modify_llama import enable_llama_pos_shift_attention
+
+        enable_llama_pos_shift_attention(model)
+    elif "falcon" in model.config.model_type:
+        from streaming_llm.pos_shift.modify_falcon import (
+            enable_falcon_pos_shift_attention,
+        )
+
+        enable_falcon_pos_shift_attention(model)
+    elif "gpt_neox" in model.config.model_type:
+        from streaming_llm.pos_shift.modify_gpt_neox import (
+            enable_gpt_neox_pos_shift_attention,
+        )
+
+        enable_gpt_neox_pos_shift_attention(model)
+    elif "mpt" in model.config.model_type:
+        pass
+    else:
+        raise ValueError(f"got {model.config.model_type}")
+elif args.enable_pos_abs:
+    assert args.enable_start_recent_kv_cache
+    if "llama" in model.config.model_type:
+        from streaming_llm.pos_shift.modify_llama import enable_llama_pos_abs_attention
+
+        enable_llama_pos_abs_attention(model)
+    else:
+        raise ValueError(f"got {model.config.model_type}")
+elif args.enable_pos_inf:
+    assert not args.enable_start_recent_kv_cache
+    if "llama" in model.config.model_type:
+        from streaming_llm.pos_shift.modify_llama import enable_llama_pos_inf_attention
+
+        enable_llama_pos_inf_attention(model)
+    else:
+        raise ValueError(f"got {model.config.model_type}")
+elif args.enable_kmeans_attention:
+    assert not args.enable_start_recent_kv_cache
+    if "llama" in model.config.model_type: 
+        from streaming_llm.pos_shift.modify_llama import enable_llama_kmeans_attention
+
+        enable_llama_kmeans_attention(model)
+    else:
+        raise ValueError(f"got {model.config.model_type}")
+
+def load_testcases(test_file):
+    with open(test_file, 'r') as json_file:
+        json_list = list(json_file)
+    test_cases = []
+    for test_case in json_list:
+        test_case = json.loads(test_case)
+        test_cases.append(test_case)
+    return test_cases
+
+
+@torch.no_grad()
+def greedy_generate(model, tokenizer, prompt, rounds, max_gen_len, kv_cache_evict=None):
+    prompt_length = 0
+
+    # prompt
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+    prompt_length += input_ids.size()[-1]
+    input_ids = input_ids.to(model.device)
+    
+    outputs = model(
+        input_ids=input_ids,
+        past_key_values=None,
+        use_cache=True,
+    )
+    past_key_values = outputs.past_key_values
+    if kv_cache_evict is not None:
+        past_key_values = kv_cache_evict(past_key_values)
+
+    # rounds
+    for text in rounds:
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+        prompt_length += input_ids.size()[-1]
+        input_ids = input_ids.to(model.device)
+
+        outputs = model(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
+        if kv_cache_evict is not None:
+            past_key_values = kv_cache_evict(past_key_values)
+
+    # generate
+    pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+    generated_ids = [pred_token_idx.item()]
+    pos = 0
+    for _ in range(max_gen_len - 1):
+        outputs = model(
+            input_ids=pred_token_idx,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
+        if kv_cache_evict is not None:
+            past_key_values = kv_cache_evict(past_key_values)
+            
+        pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+        generated_ids.append(pred_token_idx.item())
+        generated_text = (
+            tokenizer.decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True,
+                spaces_between_special_tokens=False,
+            )
+            .strip()
+            .split(" ")
+        )
+
+        now = len(generated_text) - 1
+        if now > pos:
+            print(" ".join(generated_text[pos:now]), end=" ", flush=True)
+            pos = now
+
+        if pred_token_idx == tokenizer.eos_token_id:
+            break
+    print(" ".join(generated_text[pos:]), flush=True)
+    return prompt_length, generated_text
+
+if args.task == "topics":
+    for num_topics in [5, 10, 15, 20, 25]: 
+        print(f"************ Start testing {num_topics} topics per prompt ***********")
+        avg_length = 0
+
+        test_file = os.path.join(args.dataset_name, f"topics/testcases/{num_topics}_topics.jsonl")
+
+        test_cases = load_testcases(test_file)
+        for idx, test_case in tqdm(enumerate(test_cases)):
+	    prompt = test_case["prompt"]
+            topics = test_case["topics"]
+
+            # prompt and rounds
+            prompt = prompt + "\n ASSISTANT: "
+            rounds = prompt.split("USER: ")
+            prompt, rounds = rounds[0], rounds[1:]
+            rounds = ["USER: " + t for t in rounds]
+            
+            # streaming inference
+            prompt_length, output = greedy_generate(model, tokenizer, prompt, rounds, max_gen_len=50, kv_cache_evict=kv_cache)
+
+            avg_length += prompt_length / len(test_cases)
+            summary = f"Label: {topics[0]}, Predict: {output}, prompt length: {prompt_length}".replace('\n', ' ')
+            print(summary)
+        print(f"************ Finish testing {num_topics} topics per prompt with average prompt length {avg_length} ************")
+elif args.task == "lines":
+    for num_lines in [200, 300, 400, 500, 600, 680]:
+        print(f"************ Start testing {num_lines} lines per LRT prompt ************")
+        num_correct = 0
+        avg_length = 0
+
+        test_file = os.path.join(args.dataset_name, f"lines/testcases/{num_lines}_lines.jsonl")
+
+        test_cases = load_testcases(test_file)
+        for idx, test_case in tqdm(enumerate(test_cases)):
+            prompt = test_case["prompt"]
+            correct_line = test_case["correct_line"]
+            expected_number = test_case["expected_number"]
+            
+            # prompt and rounds
+            rounds = prompt.split("\nline ")
+            prompt, rounds = rounds[0], rounds[1:]
+            rounds = ["\nline " + t for t in rounds]
+
+            # streaming inference
+            prompt_length, output = greedy_generate(model, tokenizer, prompt, rounds, max_gen_len=50, kv_cache_evict=kv_cache)
+
+            # Matching the last digit of the model output
+            response_number = re.findall("\d+", output)
+            if response_number is not None and len(response_number) > 0:
+                response_number = int(response_number[-1])
+            else:
+                print(f"Got unparsable result")
+                response_number = -1
+
+            avg_length += prompt_length / len(test_cases)
+            correct = (expected_number == response_number)
+            num_correct += correct
+            
+            summary = f"Label: {expected_number}, Predict: {output}, Parsed: {response_number}, prompt length: {prompt_length}".replace('\n', ' ')
+            print(summary)
+            
+        accuracy = num_correct / len(test_cases)
+        print(f"************ Finish testing {num_lines} lines per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
+
+
+#logfile = os.path.join(args.output_dir, "longchat_sliding{}_start{}_recent{}_posShift{}_posAbs{}_NTK{}.log".format(args.enable_start_recent_kv_cache, 
+#        args.start_size, args.recent_size, args.enable_pos_shift, args.enable_pos_abs, args.scaling_factor))
+
+
+#with open(logfile, "w") as f:
+#    for i in range(len(log_lens)):
+#        f.write(f"input length: {log_lens[i]:.0f}, ppl: {log_ppl[i]:.2f}\n")
