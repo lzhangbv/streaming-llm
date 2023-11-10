@@ -17,6 +17,8 @@ import types
 
 __all__ = ["enable_llama_pos_shift_attention", "enable_llama_pos_abs_attention", "enable_llama_pos_inf_attention", "enable_llama_kmeans_attention"]
 
+start_size = 1
+recent_size = 255
 
 def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
@@ -26,16 +28,6 @@ def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
     sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
     x_embed = (x * cos) + (rotate_half(x) * sin)
     return x_embed
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
-    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
-    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
-    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
-    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 # implement sliding window attention with relative position ids
 def llama_pos_shift_attention_forward(
@@ -393,7 +385,6 @@ def llama_pos_inf_attention_forward(
     if past_key_value is not None:
         kv_seq_len += past_key_value[0].shape[-2]
 
-    start_size, recent_size = 1, 255
     cache_size = start_size + recent_size
     cos, sin = self.rotary_emb(value_states, seq_len=cache_size)
 
@@ -476,11 +467,14 @@ def llama_pos_inf_attention_forward(
 
     return attn_output, attn_weights, past_key_value
 
-def enable_llama_pos_inf_attention(model):
+def enable_llama_pos_inf_attention(model, start=1, recent=255):
+    global start_size, recent_size
+    start_size = start
+    recent_size = recent
     for name, module in reversed(model._modules.items()):
         if len(list(module.children())) > 0:
             enable_llama_pos_inf_attention(
-                module,
+                module, start, recent
             )
 
         if isinstance(module, LlamaAttention):
@@ -544,7 +538,7 @@ def llama_kmeans_attention_forward(
     ).transpose(1, 2)
 
     # add cluster sizes
-    value_states = torch.cat([value_states, torch.ones(bsz,self.num_heads, q_len,1).to(value_states)], dim=-1) 
+    value_states = torch.cat([value_states, torch.ones(bsz, self.num_key_value_heads, q_len, 1).to(value_states)], dim=-1) 
 
     # kv_seq_len for only cached tokens
     kv_seq_len = key_states.shape[-2]
@@ -594,9 +588,14 @@ def llama_kmeans_attention_forward(
     # upcast attention to fp32
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states)
 
-    # rescaling attention weight
     count_states = value_states[:,:,:,-1].unsqueeze(-2).to(attn_weights)
     true_value_states = value_states[:,:,:,:-1]
+
+    # if any empty cluster
+    #count_states_sign = count_states > 0
+    #attn_weights = attn_weights * count_states_sign
+
+    # rescaling attention weights
     accum_attn_weights = attn_weights * count_states
     attn_weights = attn_weights/accum_attn_weights.sum(dim=-1, keepdim=True)
 
@@ -632,7 +631,7 @@ def llama_kmeans_attention_forward(
         attn_weights = None
 
     # kv cache compression
-    recent_size, cache_size = 256, 512
+    cache_size = start_size + recent_size
     bs, num_head, sq_len, _ = key_states.size()
     if sq_len >= cache_size: 
         past_key = key_states[:,:,:-recent_size,:]
@@ -646,15 +645,11 @@ def llama_kmeans_attention_forward(
         kernel_num = key_kernel.shape[2]
 
         for _ in range(5):
-            index = None
-            n = num_head // 8
-            for i in range(n):
-                dis = (past_key[:,8*i:8*(i+1),:,:].unsqueeze(3) - key_kernel[:,8*i:8*(i+1),:,:].unsqueeze(2)).norm(dim=-1)
-                _, index1 =  torch.min(dis, dim=-1) # [bs, head/8, seq], num in [0,seq/gap)
-                if index is not None:
-                    index = torch.cat([index, index1], dim=1)
-                else:
-                    index = index1
+            y_norm = key_kernel.norm(dim=-1)
+            y_norm = y_norm * y_norm
+            dis =  y_norm.unsqueeze(2) - 2 * torch.matmul(past_key, key_kernel.transpose(2, 3))
+            _, index = torch.min(dis, dim=-1) # [bs, head, seq], value in [0, kernel_num)
+
             index =  F.one_hot(index, kernel_num) # [bs, head, seq, past_seq/gap]
             index = index.transpose(-1, -2).to(past_key) # [bs, head, past_seq/gap, seq]
             key_kernel = torch.matmul(index, past_key)/(index.sum(dim=-1, keepdim=True)+0.001)
@@ -664,7 +659,6 @@ def llama_kmeans_attention_forward(
 
         key_states = torch.cat([past_key, recent_key], dim=2)
         value_states = torch.cat([past_value, recent_value], dim=2)
-        #print("cache len after compresion:", key_states.shape[2], value_states.shape[2])
 
     value_states = value_states.to(torch.float32)
     past_key_value = (key_states, value_states) if use_cache else None    
@@ -672,11 +666,14 @@ def llama_kmeans_attention_forward(
     return attn_output, attn_weights, past_key_value
 
 
-def enable_llama_kmeans_attention(model):
+def enable_llama_kmeans_attention(model, start=1, recent=255):
+    global start_size, recent_size
+    start_size = start
+    recent_size = recent
     for name, module in reversed(model._modules.items()):
         if len(list(module.children())) > 0:
             enable_llama_kmeans_attention(
-                module,
+                module, start, recent
             )
 
         if isinstance(module, LlamaAttention):

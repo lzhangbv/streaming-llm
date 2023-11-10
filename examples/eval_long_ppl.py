@@ -77,7 +77,7 @@ elif args.enable_pos_inf:
     if "llama" in model.config.model_type:
         from streaming_llm.pos_shift.modify_llama import enable_llama_pos_inf_attention
 
-        enable_llama_pos_inf_attention(model)
+        enable_llama_pos_inf_attention(model, args.start_size, args.recent_size)
     else:
         raise ValueError(f"got {model.config.model_type}")
 elif args.enable_kmeans_attention:
@@ -85,7 +85,7 @@ elif args.enable_kmeans_attention:
     if "llama" in model.config.model_type: 
         from streaming_llm.pos_shift.modify_llama import enable_llama_kmeans_attention
 
-        enable_llama_kmeans_attention(model)
+        enable_llama_kmeans_attention(model, args.start_size, args.recent_size)
     else:
         raise ValueError(f"got {model.config.model_type}")
 
@@ -99,7 +99,9 @@ for text in data["text"][: args.num_samples]:
     print(encodings.input_ids[:, :10])
 
     seq_len = encodings.input_ids.size(1)
-    print(f"seq_len: {seq_len}")
+    if seq_len < 4:
+        continue
+    print(f"seq_len: {seq_len}, eval_seq_len: {num_eval_tokens}")
     pbar = tqdm(range(0, seq_len - 1))
 
     for idx in pbar:
@@ -129,7 +131,7 @@ for text in data["text"][: args.num_samples]:
 
 f.close()
 
-log_lens = [1, 128, 256, 257, 2048, 2049, 4096, 8192, 16384]
+log_lens = [1, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 log_lens = [item for item in log_lens if item <= args.num_eval_tokens]
 assert len(nlls) >= log_lens[-1]
 
@@ -141,12 +143,9 @@ for log_len in log_lens:
 ppl = torch.exp(torch.stack(nlls).mean())
 print(ppl.item())
 
-logfile = os.path.join(args.output_dir, "ppl_sliding{}_start{}_recent{}_posShift{}_posAbs{}_NTK{}.log".format(args.enable_start_recent_kv_cache, 
-        args.start_size, args.recent_size, args.enable_pos_shift, args.enable_pos_abs, args.scaling_factor))
+logfile = os.path.join(args.output_dir, "ppl_sliding{}_posShift{}_posAbs{}_posInf{}_Kmeans{}.log".format( 
+    args.enable_start_recent_kv_cache, args.enable_pos_shift, args.enable_pos_abs, args.enable_pos_inf, args.enable_kmeans_attention))
 
-
-#with open(f"{args.output_dir}/ppl.txt", "w") as f:
-#    f.write(f"{ppl.item()}\n")
 
 with open(logfile, "w") as f:
     for i in range(len(log_lens)):

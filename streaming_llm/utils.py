@@ -60,8 +60,10 @@ def load(model_name_or_path, factor=0):
         trust_remote_code=True,
     )
     config = AutoConfig.from_pretrained(model_name_or_path)
-    if factor > 0:
+    if factor > 0 and not hasattr(config, "rope_scaling"):
         config.rope_scaling = {"type": "dynamic", "factor": factor}
+    if hasattr(config, "auto_map"):
+        config.auto_map = {} #disable modeling_flash_llama
     #print(config)
 
     model = AutoModelForCausalLM.from_pretrained(
