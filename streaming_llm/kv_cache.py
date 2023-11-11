@@ -27,6 +27,7 @@ class StartRecentKVCache:
         recent_size=512,
         k_seq_dim=2,
         v_seq_dim=2,
+        layer_id=0,
     ):
         print(f"StartRecentKVCache: {start_size}, {recent_size}")
         self.start_size = start_size
@@ -34,35 +35,34 @@ class StartRecentKVCache:
         self.cache_size = start_size + recent_size
         self.k_seq_dim = k_seq_dim
         self.v_seq_dim = v_seq_dim
+        self.layer_id = layer_id # if layer_id > 0, replace the first layer_id into dense attention; else replace the last -layer_id
         self.k_slice = DIM_TO_SLICE[k_seq_dim]
         self.v_slice = DIM_TO_SLICE[v_seq_dim]
 
     def __call__(self, past_key_values):
         if past_key_values is None:
             return None
-        seq_len = past_key_values[0][0].size(self.k_seq_dim)
+        
+        #seq_len = past_key_values[0][0].size(self.k_seq_dim)
+        seq_len = min(past_key_values[0][0].size(self.k_seq_dim), past_key_values[-1][0].size(self.k_seq_dim))
         if seq_len <= self.cache_size:
             return past_key_values
-        return [
-            [
-                torch.cat(
-                    [
-                        self.k_slice(k, 0, self.start_size),
-                        self.k_slice(k, seq_len - self.recent_size, seq_len),
-                    ],
-                    dim=self.k_seq_dim,
-                ),
-                torch.cat(
-                    [
-                        self.v_slice(v, 0, self.start_size),
-                        self.v_slice(v, seq_len - self.recent_size, seq_len),
-                    ],
-                    dim=self.v_seq_dim,
-                ),
-            ]
-            for k, v in past_key_values
-        ]
 
+        key_values = []
+        num_layers = len(past_key_values)
+        for i, (k, v) in enumerate(past_key_values):
+            if self.layer_id < 0 and i - self.layer_id >= num_layers:
+                key_values.append([k, v])
+            elif self.layer_id > 0 and i < self.layer_id:
+                key_values.append([k, v])
+            else:
+                key_values.append([
+                    torch.cat([self.k_slice(k, 0, self.start_size), self.k_slice(k, seq_len - self.recent_size, seq_len)], dim=self.k_seq_dim), 
+                    torch.cat([self.v_slice(v, 0, self.start_size), self.v_slice(v, seq_len - self.recent_size, seq_len)], dim=self.v_seq_dim),
+                    ])
+        return key_values
+
+                        
     def evict_for_space(self, past_key_values, num_coming):
         if past_key_values is None:
             return None

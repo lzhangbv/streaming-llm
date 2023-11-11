@@ -38,6 +38,7 @@ if args.enable_start_recent_kv_cache:
         recent_size=args.recent_size,
         k_seq_dim=k_seq_dim,
         v_seq_dim=v_seq_dim,
+        layer_id=args.no_sliding_layers,
     )
 else:
     kv_cache = None

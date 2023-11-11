@@ -1,11 +1,13 @@
 import torch
 from tqdm import tqdm
 import os
+import json
+import re
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from torch.nn import CrossEntropyLoss
 from streaming_llm.kv_cache import StartRecentKVCache
-from streaming_llm.utils import parse_args, load
+from streaming_llm.utils import parse_args, load, best_subspan_em
 
 device = "cuda"
 
@@ -33,6 +35,7 @@ if args.enable_start_recent_kv_cache:
         recent_size=args.recent_size,
         k_seq_dim=k_seq_dim,
         v_seq_dim=v_seq_dim,
+        layer_id=args.no_sliding_layers,
     )
 else:
     kv_cache = None
@@ -72,7 +75,7 @@ elif args.enable_pos_inf:
     if "llama" in model.config.model_type:
         from streaming_llm.pos_shift.modify_llama import enable_llama_pos_inf_attention
 
-        enable_llama_pos_inf_attention(model)
+        enable_llama_pos_inf_attention(model, args.start_size, args.recent_size)
     else:
         raise ValueError(f"got {model.config.model_type}")
 elif args.enable_kmeans_attention:
@@ -80,7 +83,7 @@ elif args.enable_kmeans_attention:
     if "llama" in model.config.model_type: 
         from streaming_llm.pos_shift.modify_llama import enable_llama_kmeans_attention
 
-        enable_llama_kmeans_attention(model)
+        enable_llama_kmeans_attention(model, args.start_size, args.recent_size)
     else:
         raise ValueError(f"got {model.config.model_type}")
 
@@ -130,7 +133,6 @@ def greedy_generate(model, tokenizer, prompt, rounds, max_gen_len, kv_cache_evic
     # generate
     pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
     generated_ids = [pred_token_idx.item()]
-    pos = 0
     for _ in range(max_gen_len - 1):
         outputs = model(
             input_ids=pred_token_idx,
@@ -143,54 +145,51 @@ def greedy_generate(model, tokenizer, prompt, rounds, max_gen_len, kv_cache_evic
             
         pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
         generated_ids.append(pred_token_idx.item())
-        generated_text = (
-            tokenizer.decode(
-                generated_ids,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=True,
-                spaces_between_special_tokens=False,
-            )
-            .strip()
-            .split(" ")
-        )
-
-        now = len(generated_text) - 1
-        if now > pos:
-            print(" ".join(generated_text[pos:now]), end=" ", flush=True)
-            pos = now
 
         if pred_token_idx == tokenizer.eos_token_id:
             break
-    print(" ".join(generated_text[pos:]), flush=True)
+    
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
     return prompt_length, generated_text
 
 if args.task == "topics":
-    for num_topics in [5, 10, 15, 20, 25]: 
+    total_num_topics = [5] #[5, 10, 15, 20, 25]
+    for num_topics in total_num_topics: 
         print(f"************ Start testing {num_topics} topics per prompt ***********")
+        num_correct = 0
         avg_length = 0
 
         test_file = os.path.join(args.dataset_name, f"topics/testcases/{num_topics}_topics.jsonl")
 
         test_cases = load_testcases(test_file)
         for idx, test_case in tqdm(enumerate(test_cases)):
-	    prompt = test_case["prompt"]
+            prompt = test_case["prompt"]
             topics = test_case["topics"]
 
             # prompt and rounds
-            prompt = prompt + "\n ASSISTANT: "
-            rounds = prompt.split("USER: ")
-            prompt, rounds = rounds[0], rounds[1:]
-            rounds = ["USER: " + t for t in rounds]
+            prompt = prompt
+            if args.chunk_infer:
+                rounds = prompt.split("USER: ")
+                prompt, rounds = rounds[0], rounds[1:]
+                rounds = ["USER: " + t for t in rounds]
+            else:
+                rounds = []
             
             # streaming inference
             prompt_length, output = greedy_generate(model, tokenizer, prompt, rounds, max_gen_len=50, kv_cache_evict=kv_cache)
 
             avg_length += prompt_length / len(test_cases)
-            summary = f"Label: {topics[0]}, Predict: {output}, prompt length: {prompt_length}".replace('\n', ' ')
+            correct = best_subspan_em(prediction=output, ground_truths=[topics[0]])
+            num_correct += correct
+            
+            summary = f"Label: {topics[0]}, Predict: {output}, Correct: {correct}, prompt length: {prompt_length}".replace('\n', ' ')
             print(summary)
-        print(f"************ Finish testing {num_topics} topics per prompt with average prompt length {avg_length} ************")
+        
+        accuracy = num_correct / len(test_cases)
+        print(f"************ Finish testing {num_topics} topics per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
 elif args.task == "lines":
-    for num_lines in [200, 300, 400, 500, 600, 680]:
+    total_num_lines = [200]  #[200, 300, 400, 500, 600, 680]
+    for num_lines in total_num_lines:
         print(f"************ Start testing {num_lines} lines per LRT prompt ************")
         num_correct = 0
         avg_length = 0
@@ -204,9 +203,12 @@ elif args.task == "lines":
             expected_number = test_case["expected_number"]
             
             # prompt and rounds
-            rounds = prompt.split("\nline ")
-            prompt, rounds = rounds[0], rounds[1:]
-            rounds = ["\nline " + t for t in rounds]
+            if args.chunk_infer:
+                rounds = prompt.split("\nline ")
+                prompt, rounds = rounds[0], rounds[1:]
+                rounds = ["\nline " + t for t in rounds]
+            else:
+                rounds = []
 
             # streaming inference
             prompt_length, output = greedy_generate(model, tokenizer, prompt, rounds, max_gen_len=50, kv_cache_evict=kv_cache)
@@ -214,7 +216,8 @@ elif args.task == "lines":
             # Matching the last digit of the model output
             response_number = re.findall("\d+", output)
             if response_number is not None and len(response_number) > 0:
-                response_number = int(response_number[-1])
+                #response_number = int(response_number[-1])
+                response_number = int(response_number[0])
             else:
                 print(f"Got unparsable result")
                 response_number = -1
