@@ -50,6 +50,7 @@ def parse_args():
     parser.add_argument("--enable_pos_inf", action="store_true")
     parser.add_argument("--enable_kmeans_attention", action="store_true")
     parser.add_argument("--chunk_infer", action="store_true")
+    parser.add_argument("--chunk_size", type=int, default=256)
     parser.add_argument("--scaling_factor", type=float, default=0)
     parser.add_argument("--no_sliding_layers", type=int, default=0)
     parser.add_argument("--num_eval_tokens", type=int, default=None)

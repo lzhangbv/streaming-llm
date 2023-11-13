@@ -98,31 +98,24 @@ def load_testcases(test_file):
 
 
 @torch.no_grad()
-def greedy_generate(model, tokenizer, prompt, rounds, max_gen_len, kv_cache_evict=None):
-    prompt_length = 0
-
+def greedy_generate(model, tokenizer, prompt, max_gen_len, kv_cache_evict=None):
     # prompt
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids
-    prompt_length += input_ids.size()[-1]
+    prompt_length = input_ids.size()[-1]
     input_ids = input_ids.to(model.device)
+
+    # chunk infer
+    if args.chunk_infer:
+        chunk_size = args.chunk_size
+        iter_num = (prompt_length+chunk_size-1) // chunk_size
+        input_chunks = [input_ids[:,i * chunk_size: (i+1) * chunk_size] for i in range(iter_num)]
+    else:
+        input_chunks = [input_ids]
     
-    outputs = model(
-        input_ids=input_ids,
-        past_key_values=None,
-        use_cache=True,
-    )
-    past_key_values = outputs.past_key_values
-    if kv_cache_evict is not None:
-        past_key_values = kv_cache_evict(past_key_values)
-
-    # rounds
-    for text in rounds:
-        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
-        prompt_length += input_ids.size()[-1]
-        input_ids = input_ids.to(model.device)
-
+    past_key_values = None
+    for input_chunk in input_chunks:
         outputs = model(
-            input_ids=input_ids,
+            input_ids=input_chunk,
             past_key_values=past_key_values,
             use_cache=True,
         )
@@ -166,17 +159,12 @@ if args.task == "topics":
             prompt = test_case["prompt"]
             topics = test_case["topics"]
 
-            # prompt and rounds
-            prompt = prompt
-            if args.chunk_infer:
-                rounds = prompt.split("USER: ")
-                prompt, rounds = rounds[0], rounds[1:]
-                rounds = ["USER: " + t for t in rounds]
-            else:
-                rounds = []
-            
+            # prompt
+            if "vicuna" in args.model_name_or_path: 
+                prompt = prompt + "\n ASSISTANT: "
+
             # streaming inference
-            prompt_length, output = greedy_generate(model, tokenizer, prompt, rounds, max_gen_len=50, kv_cache_evict=kv_cache)
+            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=50, kv_cache_evict=kv_cache)
 
             avg_length += prompt_length / len(test_cases)
             correct = best_subspan_em(prediction=output, ground_truths=[topics[0]])
@@ -202,16 +190,12 @@ elif args.task == "lines":
             correct_line = test_case["correct_line"]
             expected_number = test_case["expected_number"]
             
-            # prompt and rounds
-            if args.chunk_infer:
-                rounds = prompt.split("\nline ")
-                prompt, rounds = rounds[0], rounds[1:]
-                rounds = ["\nline " + t for t in rounds]
-            else:
-                rounds = []
+            # prompt
+            if "vicuna" in args.model_name_or_path:
+                prompt = prompt + "\n ASSISTANT: "
 
             # streaming inference
-            prompt_length, output = greedy_generate(model, tokenizer, prompt, rounds, max_gen_len=50, kv_cache_evict=kv_cache)
+            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=50, kv_cache_evict=kv_cache)
 
             # Matching the last digit of the model output
             response_number = re.findall("\d+", output)
