@@ -7,7 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from torch.nn import CrossEntropyLoss
 from streaming_llm.kv_cache import StartRecentKVCache
-from streaming_llm.utils import parse_args, load, best_subspan_em, generate_prompt_landmark
+from streaming_llm.utils import parse_args, load, best_subspan_em, generate_prompt_landmark, generate_pos_id
 
 device = "cuda"
 
@@ -159,6 +159,11 @@ if args.task == "topics":
             prompt = test_case["prompt"]
             topics = test_case["topics"]
 
+            # topic id
+            i, pos = generate_pos_id(n=num_topics, i=args.topic_id, seed=idx)
+            prompt = prompt.replace("the first topic", "the "+pos+" topic")
+            #prompt = prompt.replace("the first topic", "the last topic")
+
             # prompt
             if "vicuna" in args.model_name_or_path: 
                 prompt = prompt + "\n ASSISTANT: "
@@ -167,16 +172,16 @@ if args.task == "topics":
             prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=50, kv_cache_evict=kv_cache)
 
             avg_length += prompt_length / len(test_cases)
-            correct = best_subspan_em(prediction=output, ground_truths=[topics[0]])
+            correct = best_subspan_em(prediction=output, ground_truths=[topics[i]])
             num_correct += correct
             
-            summary = f"Label: {topics[0]}, Predict: {output}, Correct: {correct}, prompt length: {prompt_length}".replace('\n', ' ')
+            summary = f"The {pos} topic: {topics[i]}, Predict: {output}, Correct: {correct}, prompt length: {prompt_length}".replace('\n', ' ')
             print(summary)
         
         accuracy = num_correct / len(test_cases)
         print(f"************ Finish testing {num_topics} topics per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
 elif args.task == "lines":
-    total_num_lines = [200]  #[200, 300, 400, 500, 600, 680]
+    total_num_lines = [200]  #[200, 300, 400, 500, 600, 700]
     for num_lines in total_num_lines:
         print(f"************ Start testing {num_lines} lines per LRT prompt ************")
         num_correct = 0
@@ -216,7 +221,7 @@ elif args.task == "lines":
         accuracy = num_correct / len(test_cases)
         print(f"************ Finish testing {num_lines} lines per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
 elif args.task == "passkey":
-    n_garbages = [10000]
+    n_garbages = [10000] #[5000, 10000, 15000, 20000, 25000, 30000]
     for n_garbage in n_garbages:
         print(f"************ Start testing passkey retrieval with {n_garbage} garbage texts ************")
         num_correct = 0
@@ -254,12 +259,60 @@ elif args.task == "passkey":
             
         accuracy = num_correct / num_iter
         print(f"************ Finish testing passkey retrieval per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
+elif args.task == "qa":
+    total_num_docs = [10] #[10, 20, 30]
+    for num_docs in total_num_docs: 
+        print(f"************ Start testing {num_docs} documents QA ***********")
+        num_correct = 0
+        avg_length = 0
+        closedbook = False
 
+        test_file = os.path.join(args.dataset_name, f"nq-open-{num_docs}_total_documents_gold_at_{args.topic_id}.jsonl")
+        test_cases = load_testcases(test_file)
+        
+        eval_num = 50
+        for idx, test_case in enumerate(test_cases):
+            question = test_case["question"]
+            answers = test_case["answers"]
 
-#logfile = os.path.join(args.output_dir, "longchat_sliding{}_start{}_recent{}_posShift{}_posAbs{}_NTK{}.log".format(args.enable_start_recent_kv_cache, 
-#        args.start_size, args.recent_size, args.enable_pos_shift, args.enable_pos_abs, args.scaling_factor))
+            # prompt
+            if closedbook:
+                prompt = 'Question: ' + question
+            else:
+                prompt = 'Write a high-quality answer for the given question using only the provided search results (some of which might be irrelevant).\n\n'
+                
+                # query aware contextualization
+                #prompt += "Question: " + question + "\n\n"
 
+                formatted_documents = []
+                for document_id, ctx in enumerate(test_case["ctxs"]):
+                    title = ctx["title"]
+                    text = ctx["text"]
+                    formatted_documents.append(f"Document [{document_id+1}](Title: {title}) {text}")
 
-#with open(logfile, "w") as f:
-#    for i in range(len(log_lens)):
-#        f.write(f"input length: {log_lens[i]:.0f}, ppl: {log_ppl[i]:.2f}\n")
+                prompt += "\n".join(formatted_documents)
+                prompt += '\n\nQuestion: ' + question
+            
+            if "vicuna" in args.model_name_or_path:
+                prompt += '\n Assistant: '
+            else:
+                prompt += '\nAnswer:'
+
+            #print(prompt)
+            
+            # streaming inference
+            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=50, kv_cache_evict=kv_cache)
+
+            avg_length += prompt_length / eval_num
+            correct = best_subspan_em(prediction=output, ground_truths=answers)
+            num_correct += correct
+            
+            summary = f"Label: {answers[0]}, Predict: {output}, Correct: {correct}, prompt length: {prompt_length}".replace('\n', ' ')
+            print(summary)
+
+            if idx + 1 > eval_num:
+                break
+
+        accuracy = num_correct / eval_num
+        print(f"************ Finish testing {num_docs} documents QA per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
+

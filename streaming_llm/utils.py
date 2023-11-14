@@ -10,6 +10,7 @@ import ssl
 import urllib.request
 import os
 import json
+import numpy as np
 
 import string
 from typing import List
@@ -54,6 +55,7 @@ def parse_args():
     parser.add_argument("--scaling_factor", type=float, default=0)
     parser.add_argument("--no_sliding_layers", type=int, default=0)
     parser.add_argument("--num_eval_tokens", type=int, default=None)
+    parser.add_argument("--topic_id", type=int, default=0)
 
     args = parser.parse_args()
     return args
@@ -164,8 +166,6 @@ def best_subspan_em(prediction: str, ground_truths: List[str]) -> float:
 
 def generate_prompt_landmark(n_garbage, seed):
     """Generates a text file and inserts an execute line at a random position."""
-    import numpy as np
-
     rnd_state = np.random.get_state()
     np.random.seed(seed)
 
@@ -189,4 +189,18 @@ def generate_prompt_landmark(n_garbage, seed):
     np.random.set_state(rnd_state)
 
     return "\n".join(lines), pass_key
+
+def generate_pos_id(n=20, i=0, seed=42):
+    pos_maps = ['first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 
+            'tenth', 'eleventh', 'twelfth', 'thirteenth', 'fourteenth', 'fifteenth', 'sixteenth', 'seventeenth', 'eighteenth', 'nineteenth', 'twentieth']
+    assert len(pos_maps) >= n
+
+    if i < 0:
+        rnd_state = np.random.get_state()
+        np.random.seed(seed)
+        i = np.random.randint(0, n-1)
+        np.random.set_state(rnd_state)
+    
+    return i, pos_maps[i]
+
 
