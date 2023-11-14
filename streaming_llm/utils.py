@@ -50,7 +50,7 @@ def parse_args():
     parser.add_argument("--enable_pos_inf", action="store_true")
     parser.add_argument("--enable_kmeans_attention", action="store_true")
     parser.add_argument("--chunk_infer", action="store_true")
-    parser.add_argument("--chunk_size", type=int, default=256)
+    parser.add_argument("--chunk_size", type=int, default=32)
     parser.add_argument("--scaling_factor", type=float, default=0)
     parser.add_argument("--no_sliding_layers", type=int, default=0)
     parser.add_argument("--num_eval_tokens", type=int, default=None)
@@ -161,4 +161,32 @@ def best_subspan_em(prediction: str, ground_truths: List[str]) -> float:
         if normalized_ground_truth.lower() in normalized_prediction.lower():
             return 1.0
     return 0.0
+
+def generate_prompt_landmark(n_garbage, seed):
+    """Generates a text file and inserts an execute line at a random position."""
+    import numpy as np
+
+    rnd_state = np.random.get_state()
+    np.random.seed(seed)
+
+    n_garbage_prefix = np.random.randint(0, n_garbage)
+    n_garbage_suffix = n_garbage - n_garbage_prefix
+
+    task_description = "There is an important info hidden inside a lot of irrelevant text. Find it and memorize them. I will quiz you about the important information there."
+    garbage = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again."
+    garbage_inf = " ".join([garbage] * 5000)
+    assert len(garbage_inf) >= n_garbage
+
+    garbage_prefix = garbage_inf[:n_garbage_prefix]
+    garbage_suffix = garbage_inf[:n_garbage_suffix]
+
+    pass_key = np.random.randint(1, 50000)
+    information_line = f"The pass key is {pass_key}. Remember it. {pass_key} is the pass key."
+    #final_question = "What is the pass key? The pass key is"
+    final_question = "What is the pass key?"
+
+    lines = [task_description, garbage_prefix, information_line, garbage_suffix, final_question]
+    np.random.set_state(rnd_state)
+
+    return "\n".join(lines), pass_key
 

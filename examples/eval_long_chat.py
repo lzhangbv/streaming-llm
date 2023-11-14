@@ -7,7 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from torch.nn import CrossEntropyLoss
 from streaming_llm.kv_cache import StartRecentKVCache
-from streaming_llm.utils import parse_args, load, best_subspan_em
+from streaming_llm.utils import parse_args, load, best_subspan_em, generate_prompt_landmark
 
 device = "cuda"
 
@@ -215,6 +215,45 @@ elif args.task == "lines":
             
         accuracy = num_correct / len(test_cases)
         print(f"************ Finish testing {num_lines} lines per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
+elif args.task == "passkey":
+    n_garbages = [10000]
+    for n_garbage in n_garbages:
+        print(f"************ Start testing passkey retrieval with {n_garbage} garbage texts ************")
+        num_correct = 0
+        avg_length = 0
+        seed = 42
+        num_iter = 50
+        
+        for idx in range(num_iter):
+            prompt, answer = generate_prompt_landmark(n_garbage, seed+idx)
+
+            # prompt
+            if "vicuna" in args.model_name_or_path:
+                prompt += "\n ASSISTANT: The pass key is"
+            else:
+                prompt += "The pass key is"
+
+            # streaming inference
+            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=15, kv_cache_evict=kv_cache)
+
+            # Matching the last digit of the model output
+            response_number = re.findall("\d+", output)
+            if response_number is not None and len(response_number) > 0:
+                #response_number = int(response_number[-1])
+                response_number = int(response_number[0])
+            else:
+                print(f"Got unparsable result")
+                response_number = -1
+
+            avg_length += prompt_length / num_iter
+            correct = (answer == response_number)
+            num_correct += correct
+            
+            summary = f"Label: {answer}, Predict: {output}, Parsed: {response_number}, prompt length: {prompt_length}".replace('\n', ' ')
+            print(summary)
+            
+        accuracy = num_correct / num_iter
+        print(f"************ Finish testing passkey retrieval per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
 
 
 #logfile = os.path.join(args.output_dir, "longchat_sliding{}_start{}_recent{}_posShift{}_posAbs{}_NTK{}.log".format(args.enable_start_recent_kv_cache, 
