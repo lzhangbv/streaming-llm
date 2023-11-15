@@ -150,6 +150,7 @@ if args.task == "topics":
     for num_topics in total_num_topics: 
         print(f"************ Start testing {num_topics} topics per prompt ***********")
         num_correct = 0
+        num_correct_list = [0] * num_topics
         avg_length = 0
 
         test_file = os.path.join(args.dataset_name, f"topics/testcases/{num_topics}_topics.jsonl")
@@ -159,27 +160,38 @@ if args.task == "topics":
             prompt = test_case["prompt"]
             topics = test_case["topics"]
 
-            # topic id
-            i, pos = generate_pos_id(n=num_topics, i=args.topic_id, seed=idx)
-            prompt = prompt.replace("the first topic", "the "+pos+" topic")
-            #prompt = prompt.replace("the first topic", "the last topic")
+            # give all topics
+            if args.topic_id > 0:
+                prompt = prompt.replace("What is the first topic", "What are all topics")
+                prompt = prompt.replace("the first topic", "all topics")
 
             # prompt
-            if "vicuna" in args.model_name_or_path: 
+            if "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path: 
                 prompt = prompt + "\n ASSISTANT: "
 
             # streaming inference
-            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=50, kv_cache_evict=kv_cache)
+            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=num_topics * 20, kv_cache_evict=kv_cache)
 
             avg_length += prompt_length / len(test_cases)
-            correct = best_subspan_em(prediction=output, ground_truths=[topics[i]])
-            num_correct += correct
             
-            summary = f"The {pos} topic: {topics[i]}, Predict: {output}, Correct: {correct}, prompt length: {prompt_length}".replace('\n', ' ')
+            if args.topic_id > 0:
+                correct = 1
+                for i in range(num_topics):
+                    match = best_subspan_em(prediction=output, ground_truths=[topics[i]])
+                    num_correct_list[i] += match / len(test_cases)
+                    if not match:
+                        correct = 0
+            else:
+                correct = best_subspan_em(prediction=output, ground_truths=[topics[0]])
+            num_correct += correct / len(test_cases)
+            
+            summary = f"The first topic: {topics[0]}, Predict: {output}, Correct: {correct}, prompt length: {prompt_length}".replace('\n', ' ')
             print(summary)
         
-        accuracy = num_correct / len(test_cases)
+        accuracy = num_correct
         print(f"************ Finish testing {num_topics} topics per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
+        if args.topic_id > 0:
+            print("Accuracy per topic:", num_correct_list)
 elif args.task == "lines":
     total_num_lines = [200]  #[200, 300, 400, 500, 600, 700]
     for num_lines in total_num_lines:
@@ -196,7 +208,7 @@ elif args.task == "lines":
             expected_number = test_case["expected_number"]
             
             # prompt
-            if "vicuna" in args.model_name_or_path:
+            if "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path:
                 prompt = prompt + "\n ASSISTANT: "
 
             # streaming inference
@@ -221,7 +233,7 @@ elif args.task == "lines":
         accuracy = num_correct / len(test_cases)
         print(f"************ Finish testing {num_lines} lines per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
 elif args.task == "passkey":
-    n_garbages = [10000] #[5000, 10000, 15000, 20000, 25000, 30000]
+    n_garbages = [10000] #[10000, 20000, 30000, 40000, 50000, 60000]
     for n_garbage in n_garbages:
         print(f"************ Start testing passkey retrieval with {n_garbage} garbage texts ************")
         num_correct = 0
@@ -233,7 +245,7 @@ elif args.task == "passkey":
             prompt, answer = generate_prompt_landmark(n_garbage, seed+idx)
 
             # prompt
-            if "vicuna" in args.model_name_or_path:
+            if "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path:
                 prompt += "\n ASSISTANT: The pass key is"
             else:
                 prompt += "The pass key is"
@@ -289,11 +301,13 @@ elif args.task == "qa":
                     title = ctx["title"]
                     text = ctx["text"]
                     formatted_documents.append(f"Document [{document_id+1}](Title: {title}) {text}")
+                    
+                    break # add support document only
 
                 prompt += "\n".join(formatted_documents)
                 prompt += '\n\nQuestion: ' + question
             
-            if "vicuna" in args.model_name_or_path:
+            if "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path:
                 prompt += '\n Assistant: '
             else:
                 prompt += '\nAnswer:'
