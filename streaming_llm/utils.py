@@ -56,6 +56,7 @@ def parse_args():
     parser.add_argument("--no_sliding_layers", type=int, default=0)
     parser.add_argument("--num_eval_tokens", type=int, default=None)
     parser.add_argument("--topic_id", type=int, default=0)
+    parser.add_argument("--retrieval_all", action="store_true")
 
     args = parser.parse_args()
     return args
@@ -68,13 +69,14 @@ def load(model_name_or_path, factor=0):
         model_name_or_path,
         trust_remote_code=True,
     )
-    config = AutoConfig.from_pretrained(model_name_or_path)
+    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
     if factor > 0 and not hasattr(config, "rope_scaling"):
         config.rope_scaling = {"type": "dynamic", "factor": factor}
-    if hasattr(config, "auto_map"):
-        config.auto_map = {} #disable modeling_flash_llama
+    if "llama-32k" in model_name_or_path and hasattr(config, "auto_map"):
+        # disable modeling_flash_llama 
+        config.auto_map = {}
     #print(config)
-
+    
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         config=config,

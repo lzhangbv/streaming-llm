@@ -15,6 +15,7 @@ print(args)
 data = load_dataset(args.dataset_name, args.task, split=args.split)
 
 model, tokenizer = load(args.model_name_or_path, factor=args.scaling_factor)
+rwkv = "rwkv" in args.model_name_or_path
 
 nlls = []
 loss_fn = CrossEntropyLoss(reduction="none")
@@ -84,7 +85,8 @@ elif args.enable_pos_inf:
 elif args.enable_kmeans_attention:
     assert not args.enable_start_recent_kv_cache
     if "llama" in model.config.model_type: 
-        from streaming_llm.pos_shift.modify_llama import enable_llama_kmeans_attention
+        #from streaming_llm.pos_shift.modify_llama import enable_llama_kmeans_attention
+        from streaming_llm.pos_shift.kmeans_llama import enable_llama_kmeans_attention
 
         enable_llama_kmeans_attention(model, args.start_size, args.recent_size)
     else:
@@ -94,31 +96,40 @@ os.makedirs(args.output_dir, exist_ok=True)
 f = open(f"{args.output_dir}/log.txt", "w")
 
 num_eval_tokens = 0
-for text in data["text"][: args.num_samples]:
-    encodings = tokenizer(text, return_tensors="pt")
+for it, text in enumerate(data["text"][: args.num_samples]):
+    try:
+        encodings = tokenizer(text, return_tensors="pt")
+    except:
+        print("Tokenization error for the text: ", text)
+        continue
 
     print(encodings.input_ids[:, :10])
 
     seq_len = encodings.input_ids.size(1)
     if seq_len < 4:
         continue
-    print(f"seq_len: {seq_len}, eval_seq_len: {num_eval_tokens}")
+    print(f"iter: {it}, seq_len: {seq_len}, eval_seq_len: {num_eval_tokens}")
     pbar = tqdm(range(0, seq_len - 1))
 
     for idx in pbar:
         input_ids = encodings.input_ids[:, idx : idx + 1].to(device)
         with torch.no_grad():
-            outputs = model(
-                input_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
+            if rwkv:
+                outputs = model(input_ids, state=past_key_values, use_cache=True)
+                past_key_values = outputs.state
+            else:
+                outputs = model(
+                    input_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                past_key_values = outputs.past_key_values
+                if kv_cache is not None:
+                    past_key_values = kv_cache(past_key_values)
+
             logits = outputs.logits.view(-1, model.config.vocab_size)
-            past_key_values = outputs.past_key_values
             label = encodings.input_ids[:, idx + 1 : idx + 2].to(logits.device).view(-1)
             neg_log_likelihood = loss_fn(logits, label)
-            if kv_cache is not None:
-                past_key_values = kv_cache(past_key_values)
         nlls.append(neg_log_likelihood)
         pbar.set_description(
             f"nll: {neg_log_likelihood.item():.2f}, ppl: {torch.exp(neg_log_likelihood).item():.2f}"

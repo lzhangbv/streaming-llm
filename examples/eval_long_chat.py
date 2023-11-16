@@ -6,6 +6,7 @@ import re
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from torch.nn import CrossEntropyLoss
+import numpy as np
 from streaming_llm.kv_cache import StartRecentKVCache
 from streaming_llm.utils import parse_args, load, best_subspan_em, generate_prompt_landmark, generate_pos_id
 
@@ -15,6 +16,8 @@ args = parse_args()
 print(args)
 
 model, tokenizer = load(args.model_name_or_path, factor=args.scaling_factor)
+rwkv = "rwkv" in args.model_name_or_path
+
 past_key_values = None
 
 if args.enable_start_recent_kv_cache:
@@ -81,7 +84,8 @@ elif args.enable_pos_inf:
 elif args.enable_kmeans_attention:
     assert not args.enable_start_recent_kv_cache
     if "llama" in model.config.model_type: 
-        from streaming_llm.pos_shift.modify_llama import enable_llama_kmeans_attention
+        #from streaming_llm.pos_shift.modify_llama import enable_llama_kmeans_attention
+        from streaming_llm.pos_shift.kmeans_llama import enable_llama_kmeans_attention
 
         enable_llama_kmeans_attention(model, args.start_size, args.recent_size)
     else:
@@ -114,27 +118,35 @@ def greedy_generate(model, tokenizer, prompt, max_gen_len, kv_cache_evict=None):
     
     past_key_values = None
     for input_chunk in input_chunks:
-        outputs = model(
-            input_ids=input_chunk,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
-        past_key_values = outputs.past_key_values
-        if kv_cache_evict is not None:
-            past_key_values = kv_cache_evict(past_key_values)
+        if rwkv:
+            outputs = model(input_chunk, state=past_key_values, use_cache=True)
+            past_key_values = outputs.state
+        else:
+            outputs = model(
+                input_ids=input_chunk,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            if kv_cache_evict is not None:
+                past_key_values = kv_cache_evict(past_key_values)
 
     # generate
     pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
     generated_ids = [pred_token_idx.item()]
     for _ in range(max_gen_len - 1):
-        outputs = model(
-            input_ids=pred_token_idx,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
-        past_key_values = outputs.past_key_values
-        if kv_cache_evict is not None:
-            past_key_values = kv_cache_evict(past_key_values)
+        if rwkv: 
+            outputs = model(pred_token_idx, state=past_key_values, use_cache=True)
+            past_key_values = outputs.state
+        else:
+            outputs = model(
+                input_ids=pred_token_idx,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            if kv_cache_evict is not None:
+                past_key_values = kv_cache_evict(past_key_values)
             
         pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
         generated_ids.append(pred_token_idx.item())
@@ -160,8 +172,8 @@ if args.task == "topics":
             prompt = test_case["prompt"]
             topics = test_case["topics"]
 
-            # give all topics
-            if args.topic_id > 0:
+            # retrieval all topics
+            if args.retrieval_all:
                 prompt = prompt.replace("What is the first topic", "What are all topics")
                 prompt = prompt.replace("the first topic", "all topics")
 
@@ -170,28 +182,31 @@ if args.task == "topics":
                 prompt = prompt + "\n ASSISTANT: "
 
             # streaming inference
-            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=num_topics * 20, kv_cache_evict=kv_cache)
+            max_gen_len = num_topics * 20 if args.retrieval_all else 20
+            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=max_gen_len, kv_cache_evict=kv_cache)
 
             avg_length += prompt_length / len(test_cases)
             
-            if args.topic_id > 0:
+            if args.retrieval_all:
                 correct = 1
                 for i in range(num_topics):
                     match = best_subspan_em(prediction=output, ground_truths=[topics[i]])
-                    num_correct_list[i] += match / len(test_cases)
+                    num_correct_list[i] += match
                     if not match:
                         correct = 0
             else:
                 correct = best_subspan_em(prediction=output, ground_truths=[topics[0]])
-            num_correct += correct / len(test_cases)
+            num_correct += correct
             
             summary = f"The first topic: {topics[0]}, Predict: {output}, Correct: {correct}, prompt length: {prompt_length}".replace('\n', ' ')
             print(summary)
         
-        accuracy = num_correct
+        accuracy = num_correct / len(test_cases)
         print(f"************ Finish testing {num_topics} topics per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
-        if args.topic_id > 0:
+        if args.retrieval_all:
+            num_correct_list = [i/len(test_cases) for i in num_correct_list]
             print("Accuracy per topic:", num_correct_list)
+            print("Average accuracy:", np.mean(num_correct_list))
 elif args.task == "lines":
     total_num_lines = [200]  #[200, 300, 400, 500, 600, 700]
     for num_lines in total_num_lines:
@@ -212,7 +227,7 @@ elif args.task == "lines":
                 prompt = prompt + "\n ASSISTANT: "
 
             # streaming inference
-            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=50, kv_cache_evict=kv_cache)
+            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=15, kv_cache_evict=kv_cache)
 
             # Matching the last digit of the model output
             response_number = re.findall("\d+", output)
@@ -276,6 +291,7 @@ elif args.task == "qa":
     for num_docs in total_num_docs: 
         print(f"************ Start testing {num_docs} documents QA ***********")
         num_correct = 0
+        num_correct_list = [0] * num_docs
         avg_length = 0
         closedbook = False
 
@@ -286,6 +302,10 @@ elif args.task == "qa":
         for idx, test_case in enumerate(test_cases):
             question = test_case["question"]
             answers = test_case["answers"]
+            
+            # document title retrieval
+            if args.retrieval_all:
+                question = "Please list all document titles."
 
             # prompt
             if closedbook:
@@ -297,15 +317,18 @@ elif args.task == "qa":
                 #prompt += "Question: " + question + "\n\n"
 
                 formatted_documents = []
+                titles = []
                 for document_id, ctx in enumerate(test_case["ctxs"]):
                     title = ctx["title"]
                     text = ctx["text"]
                     formatted_documents.append(f"Document [{document_id+1}](Title: {title}) {text}")
-                    
-                    break # add support document only
+                    titles.append(title)
+                    # break # add support document only
 
                 prompt += "\n".join(formatted_documents)
+                # qa
                 prompt += '\n\nQuestion: ' + question
+                # prompt: give me source
             
             if "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path:
                 prompt += '\n Assistant: '
@@ -315,13 +338,26 @@ elif args.task == "qa":
             #print(prompt)
             
             # streaming inference
-            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=50, kv_cache_evict=kv_cache)
+            max_gen_len = num_docs * 20 if args.retrieval_all else 50
+            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=max_gen_len, kv_cache_evict=kv_cache)
 
             avg_length += prompt_length / eval_num
-            correct = best_subspan_em(prediction=output, ground_truths=answers)
+            if args.retrieval_all:
+                correct = 1
+                for i in range(num_docs):
+                    match = best_subspan_em(prediction=output, ground_truths=[titles[i]])
+                    num_correct_list[i] += match
+                    if not match:
+                        correct = 0
+            else:
+                correct = best_subspan_em(prediction=output, ground_truths=answers)
+
             num_correct += correct
             
-            summary = f"Label: {answers[0]}, Predict: {output}, Correct: {correct}, prompt length: {prompt_length}".replace('\n', ' ')
+            if args.retrieval_all: 
+                summary = f"The first title: {titles[0]}, Predict: {output}, Correct: {correct}, prompt length: {prompt_length}".replace('\n', ' ')
+            else:
+                summary = f"Label: {answers[0]}, Predict: {output}, Correct: {correct}, prompt length: {prompt_length}".replace('\n', ' ')
             print(summary)
 
             if idx + 1 > eval_num:
@@ -329,4 +365,9 @@ elif args.task == "qa":
 
         accuracy = num_correct / eval_num
         print(f"************ Finish testing {num_docs} documents QA per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
+        if args.retrieval_all: 
+            num_correct_list = [i/eval_num for i in num_correct_list]
+            print("Accuracy per document:", num_correct_list)
+            print("Average accuracy:", np.mean(num_correct_list))
+
 
