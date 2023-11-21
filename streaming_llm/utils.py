@@ -46,6 +46,7 @@ def parse_args():
     parser.add_argument("--enable_start_recent_kv_cache", action="store_true")
     parser.add_argument("--start_size", type=int, default=1)
     parser.add_argument("--recent_size", type=int, default=255)
+    parser.add_argument("--cache_size", type=int, default=256)
     parser.add_argument("--enable_pos_shift", action="store_true")
     parser.add_argument("--enable_pos_abs", action="store_true")
     parser.add_argument("--enable_pos_inf", action="store_true")
@@ -72,7 +73,7 @@ def load(model_name_or_path, factor=0):
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
     if factor > 0 and not hasattr(config, "rope_scaling"):
         config.rope_scaling = {"type": "dynamic", "factor": factor}
-    if "llama-32k" in model_name_or_path and hasattr(config, "auto_map"):
+    if "llama-32k" in model_name_or_path or "anima" in model_name_or_path:
         # disable modeling_flash_llama 
         config.auto_map = {}
     #print(config)

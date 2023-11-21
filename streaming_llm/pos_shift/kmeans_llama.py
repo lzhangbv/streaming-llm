@@ -14,8 +14,9 @@ from transformers.models.llama.modeling_llama import (
 )
 import types
 
-start_size = 1024
+start_size = 256
 recent_size = 1024
+cache_size = 2048
 
 def llama_kmeans_attention_forward(
     self,
@@ -165,13 +166,21 @@ def llama_kmeans_attention_forward(
         attn_weights = None
 
     # kv cache compression
-    cache_size = start_size + recent_size
+    # cache_size, start_size, recent_size = 2048, 256, 1024
     bs, num_head, sq_len, _ = key_states.size()
     if sq_len >= cache_size: 
-        past_key = key_states[:,:,:-recent_size,:]
-        past_value = value_states[:,:,:-recent_size,:]
+        start_key = key_states[:,:,:start_size,:]
+        start_value = value_states[:,:,:start_size,:]
+
+        past_key = key_states[:,:,start_size:-recent_size,:]
+        past_value = value_states[:,:,start_size:-recent_size,:]
+        
         recent_key = key_states[:,:,-recent_size:,:]
         recent_value = value_states[:,:,-recent_size:,:]
+        
+        # compress in fp32
+        #past_value = past_value.to(torch.float32)
+        #past_key = past_key.to(torch.float32)
         
         # cluster past_kv into 1/gap size
         gap = 2
@@ -191,23 +200,25 @@ def llama_kmeans_attention_forward(
         past_key = key_kernel
         past_value = torch.matmul(index.to(past_value), past_value)
 
-        key_states = torch.cat([past_key, recent_key], dim=2)
-        value_states = torch.cat([past_value, recent_value], dim=2)
+        key_states = torch.cat([start_key, past_key, recent_key], dim=2)
+        value_states = torch.cat([start_value, past_value, recent_value], dim=2)
 
+    #key_states = key_states.to(torch.float16)
     value_states = value_states.to(torch.float32)
     past_key_value = (key_states, value_states) if use_cache else None    
 
     return attn_output, attn_weights, past_key_value
 
 
-def enable_llama_kmeans_attention(model, start=1024, recent=1024):
-    global start_size, recent_size
+def enable_llama_kmeans_attention(model, start=256, recent=1024, cache=2048):
+    global start_size, recent_size, cache_size
     start_size = start
     recent_size = recent
+    cache_size = cache
     for name, module in reversed(model._modules.items()):
         if len(list(module.children())) > 0:
             enable_llama_kmeans_attention(
-                module, start, recent
+                module, start, recent, cache
             )
 
         if isinstance(module, LlamaAttention):

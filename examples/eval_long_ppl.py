@@ -88,7 +88,7 @@ elif args.enable_kmeans_attention:
         #from streaming_llm.pos_shift.modify_llama import enable_llama_kmeans_attention
         from streaming_llm.pos_shift.kmeans_llama import enable_llama_kmeans_attention
 
-        enable_llama_kmeans_attention(model, args.start_size, args.recent_size)
+        enable_llama_kmeans_attention(model, args.start_size, args.recent_size, args.cache_size)
     else:
         raise ValueError(f"got {model.config.model_type}")
 
