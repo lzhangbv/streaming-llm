@@ -248,7 +248,7 @@ elif args.task == "lines":
         accuracy = num_correct / len(test_cases)
         print(f"************ Finish testing {num_lines} lines per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
 elif args.task == "passkey":
-    n_garbages = [10000] #[10000, 20000, 30000, 40000, 50000, 60000]
+    n_garbages = [10000, 20000, 30000, 40000] #[10000, 20000, 30000, 40000, 50000, 60000]
     for n_garbage in n_garbages:
         print(f"************ Start testing passkey retrieval with {n_garbage} garbage texts ************")
         num_correct = 0
