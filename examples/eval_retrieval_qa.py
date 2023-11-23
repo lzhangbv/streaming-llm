@@ -17,9 +17,10 @@ def parse_args():
     parser.add_argument("--model_name_or_path", type=str, default="models/llama/llama-7b")
     parser.add_argument("--retrieval_name_or_path", type=str, default="models/contriever")
     parser.add_argument("--dataset_name", type=str, default="wikitext")
-    parser.add_argument("--method", type=str, default="retrieval", choices=["retrieval", "nbce"])
     parser.add_argument("--eval_num", type=int, default=50)
-
+    parser.add_argument("--method", type=str, default="retrieval", choices=["retrieval", "nbce", "nbce-v2"])
+    
+    # retrieval
     parser.add_argument("--split_text", action="store_true")
     parser.add_argument("--chunk_size", type=int, default=200)
     parser.add_argument("--topk", type=int, default=5)
@@ -28,6 +29,10 @@ def parse_args():
     parser.add_argument("--normalize_embed", action="store_true")
     parser.add_argument("--no_title", action="store_true")
     parser.add_argument("--closedbook", action="store_true")
+    parser.add_argument("--randombook", action="store_true")
+
+    # nbce
+    parser.add_argument("--beta", type=float, default=0.25)
 
     args = parser.parse_args()
     return args
@@ -96,12 +101,22 @@ def greedy_generate(model, tokenizer, prompt, max_gen_len):
     prompt_length = input_ids.size()[-1]
     input_ids = input_ids.to(model.device)
 
-    outputs = model(
-        input_ids=input_ids,
-        past_key_values=None,
-        use_cache=True,
-    )
-    past_key_values = outputs.past_key_values
+    infer_size = 1024
+    if prompt_length > infer_size:
+        iter_num = (prompt_length+infer_size-1) // infer_size
+        input_chunks = [input_ids[:,i * infer_size: (i+1) * infer_size] for i in range(iter_num)]
+    else:
+        input_chunks = [input_ids]
+
+    # chunk infer
+    past_key_values = None
+    for input_ids in input_chunks:
+        outputs = model(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
 
     # generate
     pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
@@ -144,28 +159,36 @@ def parallel_generate(model, tokenizer, batch, max_gen_len):
                         past_key_values=past_key_values
                        )
         past_key_values = outputs.past_key_values
-        
-        # ===== nbce =====
-        beta, eta = 0.25, 0.1
-        logits = outputs.logits[:, -1]
-        logits = logits - logits.logsumexp(dim=-1, keepdims=True)
-        logits = processors(input_ids, logits)
-        entropy = -(logits.exp() * logits.clip(-100, 0)).sum(dim=-1)
-        if i > 0:
-            entropy[k] -= eta
-        k = entropy[1:].argmin() + 1
-        logits_max = logits[k]
-        logits_uncond = logits[0]
-        logits_merged = (1 + beta) * logits_max - beta * logits_uncond
-        logits = torch.where(logits_uncond > -100, logits_merged, logits_max)
-        # ===== nbce =====
+
+        # ===== nbce v2=====
+        if "v2" in args.method:
+            beta, eta = args.beta, 0.1
+            logits = outputs.logits[:, -1]
+            logits = logits - logits.logsumexp(dim=-1, keepdims=True)
+            logits = processors(input_ids, logits)
+            entropy = -(logits.exp() * logits.clip(-100, 0)).sum(dim=-1)
+            if i > 0:
+                entropy[k] -= eta
+            k = entropy[1:].argmin() + 1
+            logits_max = logits[k]
+            logits_uncond = logits[0]
+            logits_merged = (1 + beta) * logits_max - beta * logits_uncond
+            logits = torch.where(logits_uncond > -100, logits_merged, logits_max)
+        else:
+            beta = args.beta
+            logits = outputs.logits[:, -1]
+            logits = logits - logits.logsumexp(dim=-1, keepdims=True)
+            k = (logits.exp() * logits).sum(dim=-1)[1:].argmax() + 1
+            logits_max = logits[k]
+            logits_uncond = logits[0]
+            logits = (1 + beta) * logits_max - beta * logits_uncond
         
         # sampling
         #tau = 0.01
         #probas = torch.nn.functional.softmax(logits[None] / tau , dim=-1)
         #next_tokens = torch.multinomial(probas, num_samples=1).squeeze(1)
-
-        # greedy
+        
+        # greedy decoding
         next_tokens = torch.argmax(logits, keepdims=True)
         
         generated_ids.append(next_tokens[0].item())
@@ -186,7 +209,7 @@ device = "cuda"
 args = parse_args()
 print(args)
 
-total_num_docs = [10] #[10, 20, 30]
+total_num_docs = [20] #[10, 20, 30]
 model, tokenizer = load(args.model_name_or_path)
 
 if args.method == "retrieval":
@@ -218,8 +241,13 @@ if args.method == "retrieval":
                 
                 # topk retrieval
                 embs, chunks = embed_passages(retrieval_model, retrieval_tokenizer, question, passages, args)
-                index = select_topk(embs[0], embs[1:], topk=args.topk)
-                print("Topk document index: ", index)
+                if args.randombook:
+                    np.random.seed(42+idx)
+                    index = np.random.choice(len(chunks), args.topk, replace=False)
+                    print("Random document index: ", index)
+                else:
+                    index = select_topk(embs[0], embs[1:], topk=args.topk)
+                    print("Topk document index: ", index)
 
                 formatted_documents = []
                 titles = []
@@ -252,7 +280,7 @@ if args.method == "retrieval":
 
         accuracy = num_correct / eval_num
         print(f"************ Finish testing {num_docs} documents QA per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
-elif args.method == "nbce":
+elif "nbce" in args.method:
     from transformers import TopPLogitsWarper, LogitsProcessorList
     processors = LogitsProcessorList()
     processors.append(TopPLogitsWarper(0.95))
@@ -273,10 +301,11 @@ elif args.method == "nbce":
             passages = test_case["ctxs"]
             
             # prompt
+            prompt = ''
             if "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path:
-                batch = ['Question: ' + question + '\n Assistant: '] + [p["text"] + '\n Question: ' + question + '\n Assistant: ' for p in passages]
+                batch = ['Question: ' + question + '\n Assistant: '] + [prompt + p["text"] + '\n Question: ' + question + '\n Assistant: ' for p in passages]
             else:
-                batch = ['Question: ' + question + '\n Answer: '] + [p["text"] + '\n Question: ' + question + '\n Answer: ' for p in passages]
+                batch = ['Question: ' + question + '\n Answer: '] + [prompt + p["text"] + '\n Question: ' + question + '\n Answer: ' for p in passages]
             
             #print(batch)
             prompt_length, output = parallel_generate(model, tokenizer, batch, max_gen_len=50)
