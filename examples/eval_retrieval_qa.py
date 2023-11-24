@@ -18,7 +18,7 @@ def parse_args():
     parser.add_argument("--retrieval_name_or_path", type=str, default="models/contriever")
     parser.add_argument("--dataset_name", type=str, default="wikitext")
     parser.add_argument("--eval_num", type=int, default=50)
-    parser.add_argument("--method", type=str, default="retrieval", choices=["retrieval", "nbce", "nbce-v2"])
+    parser.add_argument("--method", type=str, default="retrieval")
     
     # retrieval
     parser.add_argument("--split_text", action="store_true")
@@ -151,6 +151,7 @@ def parallel_generate(model, tokenizer, batch, max_gen_len):
     
     # generate
     generated_ids = []
+    joint_logits = None
     for i in range(max_gen_len):
         outputs = model(input_ids=input_ids,
                         attention_mask=attention_mask,
@@ -160,7 +161,7 @@ def parallel_generate(model, tokenizer, batch, max_gen_len):
                        )
         past_key_values = outputs.past_key_values
 
-        # ===== nbce v2=====
+        # ===== nbce=====
         if "v2" in args.method:
             beta, eta = args.beta, 0.1
             logits = outputs.logits[:, -1]
@@ -174,6 +175,28 @@ def parallel_generate(model, tokenizer, batch, max_gen_len):
             logits_uncond = logits[0]
             logits_merged = (1 + beta) * logits_max - beta * logits_uncond
             logits = torch.where(logits_uncond > -100, logits_merged, logits_max)
+        elif "v3" in args.method:
+            beta = args.beta
+            logits = outputs.logits[:, -1]
+            logits = (1 + beta) * logits[1:] - beta * logits[0]
+
+            logits = torch.nan_to_num(logits)
+            logits = logits - logits.logsumexp(dim=-1, keepdims=True)
+            k = (logits.exp() * logits).sum(dim=-1).argmax()
+            logits = logits[k]
+            ## ideal selection
+            #logits = logits[0]
+        elif "v4" in args.method:
+            beta = args.beta
+            tau = 0.01
+            logits = outputs.logits[:, -1]
+            logits = (1 + beta) * logits[1:] - beta * logits[0]
+            logits = torch.nan_to_num(logits)
+
+            logits = logits - logits.logsumexp(dim=-1, keepdims=True)
+            entropy = (logits.exp() * logits).sum(dim=-1)
+            weights = torch.nn.functional.softmax(entropy / tau, dim=-1).unsqueeze(-1) 
+            logits = (weights * logits).sum(dim=0)
         else:
             beta = args.beta
             logits = outputs.logits[:, -1]
@@ -209,7 +232,7 @@ device = "cuda"
 args = parse_args()
 print(args)
 
-total_num_docs = [20] #[10, 20, 30]
+total_num_docs = [10] #[10, 20, 30]
 model, tokenizer = load(args.model_name_or_path)
 
 if args.method == "retrieval":
