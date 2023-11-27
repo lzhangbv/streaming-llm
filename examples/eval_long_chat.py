@@ -158,7 +158,7 @@ def greedy_generate(model, tokenizer, prompt, max_gen_len, kv_cache_evict=None):
     return prompt_length, generated_text
 
 if args.task == "topics":
-    total_num_topics = [5] #[5, 10, 15, 20, 25]
+    total_num_topics = [5, 10, 15, 20] #[5, 10, 15, 20, 25]
     for num_topics in total_num_topics: 
         print(f"************ Start testing {num_topics} topics per prompt ***********")
         num_correct = 0
@@ -178,12 +178,20 @@ if args.task == "topics":
                 prompt = prompt.replace("the first topic", "all topics")
 
             # prompt
-            if "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path: 
+            if "chatglm" in args.model_name_or_path:
+                prompt_length = tokenizer(prompt, return_tensors="pt").input_ids.size()[-1]
+                output, history = model.chat(tokenizer, prompt, history=[], do_sample=False, top_p=None)
+                #to fix: build chat input + greedy decoding didn't work
+                #prompt = tokenizer.build_chat_input(prompt).input_ids[0]
+                #prompt = tokenizer.decode(prompt[2:], skip_special_tokens=True)
+            elif "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path: 
                 prompt = prompt + "\n ASSISTANT: "
 
+
             # streaming inference
-            max_gen_len = num_topics * 20 if args.retrieval_all else 20
-            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=max_gen_len, kv_cache_evict=kv_cache)
+            if not "chatglm" in args.model_name_or_path:
+                max_gen_len = num_topics * 20 if args.retrieval_all else 20
+                prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=max_gen_len, kv_cache_evict=kv_cache)
 
             avg_length += prompt_length / len(test_cases)
             
@@ -223,11 +231,15 @@ elif args.task == "lines":
             expected_number = test_case["expected_number"]
             
             # prompt
-            if "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path:
+            if "chatglm" in args.model_name_or_path:
+                prompt_length = tokenizer(prompt, return_tensors="pt").input_ids.size()[-1]
+                output, history = model.chat(tokenizer, prompt, history=[], do_sample=False, top_p=None)
+            elif "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path:
                 prompt = prompt + "\n ASSISTANT: "
 
             # streaming inference
-            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=15, kv_cache_evict=kv_cache)
+            if not "chatglm" in args.model_name_or_path:
+                prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=15, kv_cache_evict=kv_cache)
 
             # Matching the last digit of the model output
             response_number = re.findall("\d+", output)
@@ -248,7 +260,7 @@ elif args.task == "lines":
         accuracy = num_correct / len(test_cases)
         print(f"************ Finish testing {num_lines} lines per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
 elif args.task == "passkey":
-    n_garbages = [10000, 20000, 30000, 40000] #[10000, 20000, 30000, 40000, 50000, 60000]
+    n_garbages = [10000] #[10000, 20000, 30000, 40000, 50000, 60000]
     for n_garbage in n_garbages:
         print(f"************ Start testing passkey retrieval with {n_garbage} garbage texts ************")
         num_correct = 0
@@ -260,13 +272,17 @@ elif args.task == "passkey":
             prompt, answer = generate_prompt_landmark(n_garbage, seed+idx)
 
             # prompt
-            if "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path:
+            if "chatglm" in args.model_name_or_path:
+                prompt_length = tokenizer(prompt, return_tensors="pt").input_ids.size()[-1]
+                output, history = model.chat(tokenizer, prompt, history=[], do_sample=False, top_p=None)
+            elif "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path:
                 prompt += "\n ASSISTANT: The pass key is"
             else:
                 prompt += "The pass key is"
 
             # streaming inference
-            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=15, kv_cache_evict=kv_cache)
+            if not "chatglm" in args.model_name_or_path:
+                prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=15, kv_cache_evict=kv_cache)
 
             # Matching the last digit of the model output
             response_number = re.findall("\d+", output)
@@ -330,7 +346,10 @@ elif args.task == "qa":
                 prompt += '\n\nQuestion: ' + question
                 # prompt: give me source
             
-            if "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path:
+            if "chatglm" in args.model_name_or_path:
+                prompt_length = tokenizer(prompt, return_tensors="pt").input_ids.size()[-1]
+                output, history = model.chat(tokenizer, prompt, history=[], do_sample=False, top_p=None)
+            elif "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path:
                 prompt += '\n Assistant: '
             else:
                 prompt += '\nAnswer:'
@@ -338,8 +357,9 @@ elif args.task == "qa":
             #print(prompt)
             
             # streaming inference
-            max_gen_len = num_docs * 20 if args.retrieval_all else 50
-            prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=max_gen_len, kv_cache_evict=kv_cache)
+            if not "chatglm" in args.model_name_or_path:
+                max_gen_len = num_docs * 20 if args.retrieval_all else 50
+                prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=max_gen_len, kv_cache_evict=kv_cache)
 
             avg_length += prompt_length / eval_num
             if args.retrieval_all:

@@ -33,6 +33,7 @@ def parse_args():
 
     # nbce
     parser.add_argument("--beta", type=float, default=0.25)
+    parser.add_argument("--tau", type=float, default=1)
 
     args = parser.parse_args()
     return args
@@ -188,7 +189,7 @@ def parallel_generate(model, tokenizer, batch, max_gen_len):
             #logits = logits[0]
         elif "v4" in args.method:
             beta = args.beta
-            tau = 0.01
+            tau = args.tau
             logits = outputs.logits[:, -1]
             logits = (1 + beta) * logits[1:] - beta * logits[0]
             logits = torch.nan_to_num(logits)
@@ -232,7 +233,7 @@ device = "cuda"
 args = parse_args()
 print(args)
 
-total_num_docs = [10] #[10, 20, 30]
+total_num_docs = [10, 20, 30] #[10, 20, 30]
 model, tokenizer = load(args.model_name_or_path)
 
 if args.method == "retrieval":
