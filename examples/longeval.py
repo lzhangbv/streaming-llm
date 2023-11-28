@@ -8,6 +8,7 @@ from typing import List
 import regex
 import argparse
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from streaming_llm.conversation import get_conv_template
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -174,7 +175,11 @@ if args.task == "topics":
 
             # prompt
             if "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path: 
-                prompt = prompt + "\n ASSISTANT: "
+                #prompt = prompt + "\n ASSISTANT: "
+                conv = get_conv_template("vicuna_v1.1")
+                conv.append_message(conv.roles[0], prompt)
+                conv.append_message(conv.roles[1], None)
+                prompt = conv.get_prompt()
 
             # inference
             prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=50)
@@ -206,7 +211,11 @@ elif args.task == "lines":
             
             # prompt
             if "vicuna" in args.model_name_or_path or "chat" in args.model_name_or_path:
-                prompt = prompt + "\n ASSISTANT: "
+                #prompt = prompt + "\n ASSISTANT: "
+                conv = get_conv_template("vicuna_v1.1")
+                conv.append_message(conv.roles[0], prompt)
+                conv.append_message(conv.roles[1], None)
+                prompt = conv.get_prompt()
 
             # inference
             prompt_length, output = greedy_generate(model, tokenizer, prompt, max_gen_len=15)

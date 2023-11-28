@@ -158,7 +158,7 @@ def greedy_generate(model, tokenizer, prompt, max_gen_len, kv_cache_evict=None):
     return prompt_length, generated_text
 
 if args.task == "topics":
-    total_num_topics = [5, 10, 15, 20] #[5, 10, 15, 20, 25]
+    total_num_topics = [5] #[5, 10, 15, 20, 25]
     for num_topics in total_num_topics: 
         print(f"************ Start testing {num_topics} topics per prompt ***********")
         num_correct = 0
@@ -180,7 +180,7 @@ if args.task == "topics":
             # prompt
             if "chatglm" in args.model_name_or_path:
                 prompt_length = tokenizer(prompt, return_tensors="pt").input_ids.size()[-1]
-                output, history = model.chat(tokenizer, prompt, history=[], do_sample=False, top_p=None)
+                output, history = model.chat(tokenizer, prompt, history=[], do_sample=False, top_p=None, max_length=None, max_new_tokens=400)
                 #to fix: build chat input + greedy decoding didn't work
                 #prompt = tokenizer.build_chat_input(prompt).input_ids[0]
                 #prompt = tokenizer.decode(prompt[2:], skip_special_tokens=True)
