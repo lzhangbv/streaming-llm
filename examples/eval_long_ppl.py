@@ -85,10 +85,10 @@ elif args.enable_pos_inf:
 elif args.enable_kmeans_attention:
     assert not args.enable_start_recent_kv_cache
     if "llama" in model.config.model_type: 
-        #from streaming_llm.pos_shift.modify_llama import enable_llama_kmeans_attention
-        from streaming_llm.pos_shift.kmeans_llama import enable_llama_kmeans_attention
-
-        enable_llama_kmeans_attention(model, args.start_size, args.recent_size, args.cache_size)
+        #from streaming_llm.pos_shift.kmeans_llama import enable_llama_kmeans_attention
+        #enable_llama_kmeans_attention(model, args.start_size, args.recent_size, args.cache_size)
+        from streaming_llm.pos_shift.kmeans_llama import enable_llama_kmeans_attention_v2
+        enable_llama_kmeans_attention_v2(model, args.start_size, args.recent_size, args.cache_size)
     else:
         raise ValueError(f"got {model.config.model_type}")
 
