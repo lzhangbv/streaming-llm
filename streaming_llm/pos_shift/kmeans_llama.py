@@ -406,7 +406,6 @@ def llama_kmeans_attention_forward_v2(
     past_key_value = (key_states, value_states, number_states) if use_cache else None
     return attn_output, attn_weights, past_key_value
 
-
 def enable_llama_kmeans_attention(model, start=256, recent=1024, cache=2048):
     global start_size, recent_size, cache_size
     start_size = start
@@ -438,4 +437,5 @@ def enable_llama_kmeans_attention_v2(model, start=256, recent=1024, cache=2048):
             model._modules[name].forward = types.MethodType(
                 llama_kmeans_attention_forward_v2, model._modules[name]
             )
+
 

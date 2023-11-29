@@ -1,6 +1,7 @@
 import torch
 from tqdm import tqdm
 import os
+import time
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from torch.nn import CrossEntropyLoss
@@ -82,11 +83,26 @@ elif args.enable_pos_inf:
         enable_llama_pos_inf_attention(model, args.start_size, args.recent_size)
     else:
         raise ValueError(f"got {model.config.model_type}")
+elif args.enable_xformers:
+    assert not args.enable_start_recent_kv_cache
+    if "llama" in model.config.model_type:
+        from streaming_llm.pos_shift.modify_llama import enable_llama_xops_attention
+
+        enable_llama_xops_attention(model)
+    else:
+        raise ValueError(f"got {model.config.model_type}")
 elif args.enable_kmeans_attention:
     assert not args.enable_start_recent_kv_cache
     if "llama" in model.config.model_type: 
-        #from streaming_llm.pos_shift.kmeans_llama import enable_llama_kmeans_attention
-        #enable_llama_kmeans_attention(model, args.start_size, args.recent_size, args.cache_size)
+        from streaming_llm.pos_shift.kmeans_llama import enable_llama_kmeans_attention
+        enable_llama_kmeans_attention(model, args.start_size, args.recent_size, args.cache_size)
+        #from streaming_llm.pos_shift.kmeans_llama import enable_llama_kmeans_attention_v2
+        #enable_llama_kmeans_attention_v2(model, args.start_size, args.recent_size, args.cache_size)
+    else:
+        raise ValueError(f"got {model.config.model_type}")
+elif args.enable_kmeans_attention_v2:
+    assert not args.enable_start_recent_kv_cache
+    if "llama" in model.config.model_type: 
         from streaming_llm.pos_shift.kmeans_llama import enable_llama_kmeans_attention_v2
         enable_llama_kmeans_attention_v2(model, args.start_size, args.recent_size, args.cache_size)
     else:
@@ -96,6 +112,7 @@ os.makedirs(args.output_dir, exist_ok=True)
 f = open(f"{args.output_dir}/log.txt", "w")
 
 num_eval_tokens = 0
+stime = time.time()
 for it, text in enumerate(data["text"][: args.num_samples]):
     try:
         encodings = tokenizer(text, return_tensors="pt")
@@ -140,7 +157,7 @@ for it, text in enumerate(data["text"][: args.num_samples]):
             break
     if args.num_eval_tokens is not None and num_eval_tokens >= args.num_eval_tokens:
         break
-
+print("Time: ", time.time()-stime)
 f.close()
 
 log_lens = [1, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
