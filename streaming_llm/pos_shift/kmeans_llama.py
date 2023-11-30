@@ -17,6 +17,7 @@ import types
 start_size = 256
 recent_size = 1024
 cache_size = 2048
+EPS = 1e-7  #too small eps would overflow in fp16 
 
 def llama_kmeans_attention_forward(
     self,
@@ -303,7 +304,7 @@ def llama_kmeans_attention_forward_v2(
 
     if self.abs_kv_seq_len > kv_seq_len: 
         # attention bias mode
-        bias = torch.log(number_states + 1e-9).transpose(-1, -2)
+        bias = torch.log(number_states + EPS).transpose(-1, -2)
         attn_weights = attn_weights + bias.to(attn_weights)
 
     if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
@@ -327,7 +328,6 @@ def llama_kmeans_attention_forward_v2(
     #attn_weights = accum_attn_weights/accum_attn_weights.sum(dim=-1, keepdim=True)
     
     attn_output = torch.matmul(attn_weights, value_states)
-    #attn_output = torch.matmul(attn_weights, value_states/number_states)
 
     if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
         raise ValueError(
@@ -364,10 +364,14 @@ def llama_kmeans_attention_forward_v2(
         start_key = key_states[:,:,:start_size,:]
         start_value = value_states[:,:,:start_size,:]
         start_number = number_states[:,:,:start_size,:]
-
-        past_key = key_states[:,:,start_size:-recent_size,:].to(torch.float32)
-        past_value = value_states[:,:,start_size:-recent_size,:].to(torch.float32)
-        past_number = number_states[:,:,start_size:-recent_size,:].to(torch.float32)
+        
+        past_key = key_states[:,:,start_size:-recent_size,:]
+        past_value = value_states[:,:,start_size:-recent_size,:]
+        past_number = number_states[:,:,start_size:-recent_size,:]
+        
+        # using float32
+        #past_value = past_value.to(torch.float32)
+        #past_number = past_number.to(torch.float32)
         
         recent_key = key_states[:,:,-recent_size:,:]
         recent_value = value_states[:,:,-recent_size:,:]
@@ -386,19 +390,23 @@ def llama_kmeans_attention_forward_v2(
 
             index =  F.one_hot(index, kernel_num) # [bs, head, seq, past_seq/gap]
             index = index.transpose(-1, -2).to(past_key) # [bs, head, past_seq/gap, seq]
-            key_kernel = torch.matmul(index, past_key)/(index.sum(dim=-1, keepdim=True)+0.001)
+            key_kernel = torch.matmul(index, past_key)/(index.sum(dim=-1, keepdim=True)+EPS)
+        past_key = key_kernel
 
-        # update past values
-        past_value = past_value * past_number
+        # update past values (avoid overflow)
+        past_value = past_value / 1000 * past_number
         past_value = torch.matmul(index.to(past_value), past_value)
         past_number = torch.matmul(index.to(past_number), past_number)
-        past_value = past_value / (past_number + 1e-9)
+        past_value = past_value / (past_number + EPS) * 1000
+
+        #if torch.isnan(past_value).sum():
+        #    print(past_value)
+
+        # convert back if using float32
+        #past_value = past_value.to(recent_value.dtype)
+        #past_number = past_number.to(recent_number.dtype)
 
         # combine all results
-        past_key = key_kernel.to(recent_key.dtype)
-        past_value = past_value.to(recent_value.dtype)
-        past_number = past_number.to(recent_number.dtype)
-
         key_states = torch.cat([start_key, past_key, recent_key], dim=2)
         value_states = torch.cat([start_value, past_value, recent_value], dim=2)
         number_states = torch.cat([start_number, past_number, recent_number], dim=2)

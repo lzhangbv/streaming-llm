@@ -21,7 +21,12 @@ def parse_args():
     parser.add_argument("--chunk_infer", action="store_true")
     parser.add_argument("--chunk_size", type=int, default=1024)
     parser.add_argument("--no_cache", action="store_true")
+    # xformers and flashattention
     parser.add_argument("--enable_xformers", action="store_true")
+    parser.add_argument("--enable_flash", action="store_true")
+    # bnb quantization
+    parser.add_argument("--load_in_8bit", action="store_true")
+    parser.add_argument("--load_in_4bit", action="store_true")
 
     args = parser.parse_args()
     return args
@@ -40,6 +45,9 @@ def load(model_name_or_path):
         device_map="auto",
         torch_dtype=torch.float16,
         trust_remote_code=True,
+        use_flash_attention_2=args.enable_flash,
+        load_in_8bit=args.load_in_8bit,
+        load_in_4bit=args.load_in_4bit,
     )
 
     model.eval()
