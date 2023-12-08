@@ -51,6 +51,7 @@ def parse_args():
     parser.add_argument("--enable_pos_abs", action="store_true")
     parser.add_argument("--enable_pos_inf", action="store_true")
     parser.add_argument("--enable_xformers", action="store_true")
+    parser.add_argument("--enable_blockwise_attention", action="store_true")
     parser.add_argument("--enable_kmeans_attention", action="store_true")
     parser.add_argument("--enable_kmeans_attention_v2", action="store_true")
     parser.add_argument("--chunk_infer", action="store_true")
