@@ -29,24 +29,33 @@ def load_model(model, draft_model):
         model,
         trust_remote_code=True,
     )
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is not None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        else:
+            tokenizer.pad_token_id = 0
     
     if "gptq" in model: 
         from auto_gptq import AutoGPTQForCausalLM
-        model = AutoGPTQForCausalLM.from_quantized(model).cuda()
+        model = AutoGPTQForCausalLM.from_quantized(model, device_map='auto')
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model,
+            device_map='auto',
             trust_remote_code=True,
-        ).cuda()
+        )
 
     if "gptq" in draft_model: 
         from auto_gptq import AutoGPTQForCausalLM
-        draft_model = AutoGPTQForCausalLM.from_quantized(draft_model).cuda()
+        draft_model = AutoGPTQForCausalLM.from_quantized(draft_model, device_map='auto')
     else:
         draft_model = AutoModelForCausalLM.from_pretrained(
             draft_model,
+            device_map='auto',
             trust_remote_code=True,
-        ).cuda()
+            #load_in_8bit=True,
+            #load_in_4bit=True,
+        )
 
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token_id is not None:
@@ -165,7 +174,7 @@ def rollback_kv_cache(past_key_values, n):
         ] 
 
 @torch.no_grad()
-def generate(args, model, draft_model, encoded):
+def generate(args, model, draft_model, encoded, eos_token_id):
     T = encoded.shape[1] #(bsz, seq_len)
     assert encoded.shape[0] == 1
 
@@ -187,6 +196,11 @@ def generate(args, model, draft_model, encoded):
     while input_pos < T_new - 1:
         cur_token = next_token
         next_tokens, past_key_values, draft_past_key_values = speculative_decode(args, model, draft_model, cur_token, input_pos, past_key_values, draft_past_key_values)
+        # eos 
+        eos_location = (next_tokens == eos_token_id).nonzero()
+        if eos_location.shape[0]: 
+            next_tokens = next_tokens[:eos_location[0].item() + 1]
+
         accept_counts[len(next_tokens) - 1] += 1
         num_added = min(T_new - input_pos - 1, len(next_tokens))
         seq[input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
@@ -195,6 +209,9 @@ def generate(args, model, draft_model, encoded):
         # rollback kv cache
         past_key_values = rollback_kv_cache(past_key_values, input_pos)
         draft_past_key_values = rollback_kv_cache(draft_past_key_values, input_pos)
+        # eos
+        if eos_location.shape[0]:
+            return seq[:input_pos+1], accept_counts
     return seq, accept_counts
 
 
@@ -212,7 +229,7 @@ def main(args):
         
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
         input_ids = input_ids.to(model.device)
-        outputs, accept_count = generate(args, model, draft_model, encoded=input_ids)
+        outputs, accept_count = generate(args, model, draft_model, encoded=input_ids, eos_token_id=tokenizer.eos_token_id)
         accept_counts.append(accept_count)
         
         T = input_ids.shape[1]
