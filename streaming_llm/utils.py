@@ -79,6 +79,9 @@ def load(model_name_or_path, factor=0):
     if "llama-32k" in model_name_or_path or "anima" in model_name_or_path:
         # disable modeling_flash_llama 
         config.auto_map = {}
+    #if "neural-chat" in model_name_or_path:
+    #    # extend sliding window length
+    #    config.sliding_window = 32768
     #print(config)
     
     model = AutoModelForCausalLM.from_pretrained(
