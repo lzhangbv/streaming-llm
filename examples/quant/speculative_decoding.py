@@ -11,7 +11,7 @@ def parse_args():
     parser.add_argument("--model_name_or_path", type=str)
     parser.add_argument("--data_root", type=str, default="data/")
     parser.add_argument('--num_samples', type=int, default=None)
-    parser.add_argument('--max_new_tokens', type=int, default=200)
+    parser.add_argument('--max_new_tokens', type=int, default=1024)
     parser.add_argument('--top_k', type=float, default=200)
     parser.add_argument('--temperature', type=float, default=0.8)
     # speculative decoding
@@ -19,6 +19,8 @@ def parse_args():
     parser.add_argument('--speculate_k', type=int, default=5)
     # hf assisted decoding
     parser.add_argument('--hf_assisted', action="store_true") 
+    # support multi-turn chat
+    parser.add_argument('--multi_turn', action="store_true") 
     
     args = parser.parse_args()
     return args
@@ -57,12 +59,6 @@ def load_model(model, draft_model):
             #load_in_4bit=True,
         )
 
-    if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token_id is not None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-        else:
-            tokenizer.pad_token_id = 0
-
     model.eval()    
     draft_model.eval()
     return tokenizer, model, draft_model
@@ -84,8 +80,10 @@ def load_mt_bench(args):
     
     prompts = []
     for idx, example in enumerate(list_data):
-        #prompts += example["turns"]  # add two turns
-        prompts.append(example["turns"][0])  # add first turn
+        if args.multi_turn: 
+            prompts += example["turns"]  # add two turns
+        else:
+            prompts.append(example["turns"][0])  # add first turn
         if (idx + 1) == args.num_samples:
             break
     return  prompts
@@ -216,16 +214,24 @@ def generate(args, model, draft_model, encoded, eos_token_id):
 
 
 def main(args):
-    prompts = load_mt_bench(args)
+    user_prompts = load_mt_bench(args)
     tokenizer, model, draft_model = load_model(args.model_name_or_path, args.draft_name_or_path)
 
     accept_counts = []
-    for idx, prompt in enumerate(prompts):
-        print("\n" + prompt, end="")
-        
-        if "llama2" in args.model_name_or_path: 
-            system = "You are a helpful, respectful and honest assistant. "
-            prompt = f"[INST] <<SYS>>\n{system}\n<</SYS>>\n\n{prompt}[/INST]"
+    prompt = None
+    for idx, user_prompt in enumerate(user_prompts):
+        print("\n" + user_prompt)
+        if prompt is None: # first-turn
+            if "llama2" in args.model_name_or_path: 
+                system = "You are a helpful, respectful and honest assistant. "
+                prompt = f"[INST] <<SYS>>\n{system}\n<</SYS>>\n\n{user_prompt}[/INST]"
+            else:
+                prompt = f"User: {user_prompt}\nAssistant: "
+        else: # second-turn
+            if "llama2" in args.model_name_or_path:
+                prompt += f"[INST] {user_prompt} [/INST]"
+            else:
+                prompt += f"User: {user_prompt}\nAssistant: "
         
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
         input_ids = input_ids.to(model.device)
@@ -233,7 +239,13 @@ def main(args):
         accept_counts.append(accept_count)
         
         T = input_ids.shape[1]
-        print(tokenizer.decode(outputs[T:].tolist(), skip_special_tokens=True))
+        answer = tokenizer.decode(outputs[T:].tolist(), skip_special_tokens=True)
+        print(answer)
+
+        if args.multi_turn and idx % 2 == 0:
+            prompt += answer
+        else:
+            prompt = None 
 
     counts_aggregated = [sum(i) for i in zip(*accept_counts)]
     acceptance_probs = [i/sum(counts_aggregated) for i in counts_aggregated]
