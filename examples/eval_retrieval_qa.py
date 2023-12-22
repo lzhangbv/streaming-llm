@@ -145,6 +145,10 @@ def parallel_generate(model, tokenizer, batch, max_gen_len):
     inputs = tokenizer(batch, padding='longest', return_tensors='pt').to(model.device)
     input_ids = inputs.input_ids
     attention_mask = inputs.attention_mask
+
+    # prepare position ids
+    position_ids = attention_mask.long().cumsum(-1) - 1
+    position_ids.masked_fill_(attention_mask == 0, 1)
     
     past_key_values = None
     n = input_ids.shape[0]
@@ -155,6 +159,7 @@ def parallel_generate(model, tokenizer, batch, max_gen_len):
     joint_logits = None
     for i in range(max_gen_len):
         outputs = model(input_ids=input_ids,
+                        position_ids=position_ids,
                         attention_mask=attention_mask,
                         return_dict=True,
                         use_cache=True,
@@ -225,6 +230,7 @@ def parallel_generate(model, tokenizer, batch, max_gen_len):
         # prepare for next iteration
         input_ids = next_tokens.unsqueeze(-1).tile(n, 1)
         attention_mask = torch.cat([attention_mask, torch.ones(n, 1, dtype=torch.long, device=device)], dim=-1) 
+        position_ids = position_ids[:, -1].unsqueeze(-1) + 1
     
     generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
     return prompt_length, generated_text
