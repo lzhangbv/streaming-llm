@@ -111,13 +111,19 @@ input_ids = torch.randint(0, vocab_size-1, (args.bs, args.input), dtype=torch.lo
 max_gen_len = args.output
 
 iter_times = []
+tokens_per_sec = []
 for x in range(args.num_iters + 1):
     stime = time.time()
     benchmark_step(model, input_ids, max_gen_len)
-    iter_times.append(time.time() - stime)
-    print('Iter #%d: %.3f seconds' % (x, iter_times[-1]))
+    t = time.time() - stime
+    iter_times.append(t)
+    tokens_per_sec.append(max_gen_len/t)
+    print('Iter #%d: %.3f seconds, %.3f tokens/second' % (x, iter_times[-1], tokens_per_sec[-1]))
+
 iter_times = iter_times[1:]
+tokens_per_sec = tokens_per_sec[1:]
 
 # Results
-print('Iteraction time: %.3f +-%.3f' % (np.mean(iter_times), 1.96*np.std(iter_times)))
+print('Iteraction time: %.3f +-%.3f seconds' % (np.mean(iter_times), 1.96*np.std(iter_times)))
+print('Throughput: %.3f +-%.3f tokens/second' % (np.mean(tokens_per_sec), 1.96*np.std(tokens_per_sec)))
 
