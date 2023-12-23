@@ -42,10 +42,9 @@ def setup_llama_model(model, max_batch_size=1):
             dtype = module.embed_tokens.weight.data.dtype
             device = module.embed_tokens.weight.data.device
             print(f"token embed dtype: {dtype}, device: {device}")
-            cond = torch.tril(torch.ones((max_seq_length, max_seq_length), dtype=torch.bool, device=device))
-            causal_mask = torch.full((max_seq_length, max_seq_length), torch.finfo(dtype).min, device=device)
-            causal_mask.masked_fill_(cond, 0)
-            module.causal_mask = causal_mask
+            module.causal_mask = torch.tril(
+                torch.ones((max_seq_length, max_seq_length), dtype=torch.bool, device=device)
+            )
 
 def llama_attention_forward(
     self,
@@ -58,38 +57,9 @@ def llama_attention_forward(
 ):
     bsz, q_len, _ = hidden_states.size()
 
-    if self.config.pretraining_tp > 1:
-        key_value_slicing = (
-            self.num_key_value_heads * self.head_dim
-        ) // self.config.pretraining_tp
-        query_slices = self.q_proj.weight.split(
-            (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
-        )
-        key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
-        value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
-
-        query_states = [
-            F.linear(hidden_states, query_slices[i])
-            for i in range(self.config.pretraining_tp)
-        ]
-        query_states = torch.cat(query_states, dim=-1)
-
-        key_states = [
-            F.linear(hidden_states, key_slices[i])
-            for i in range(self.config.pretraining_tp)
-        ]
-        key_states = torch.cat(key_states, dim=-1)
-
-        value_states = [
-            F.linear(hidden_states, value_slices[i])
-            for i in range(self.config.pretraining_tp)
-        ]
-        value_states = torch.cat(value_states, dim=-1)
-
-    else:
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)
 
     query_states = query_states.view(
         bsz, q_len, self.num_heads, self.head_dim
@@ -121,59 +91,21 @@ def llama_attention_forward(
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-    # todo: use F.scaled_dot_product_attention
-    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
-        self.head_dim
+    # SDPA
+    attn_output = F.scaled_dot_product_attention(
+        query_states, 
+        key_states, 
+        value_states, 
+        attn_mask=attention_mask, 
+        dropout_p=0.0
     )
-
-    if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-        raise ValueError(
-            f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-            f" {attn_weights.size()}"
-        )
-
-    if attention_mask is not None:
-        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-            )
-        attn_weights = attn_weights + attention_mask
-
-    # upcast attention to fp32
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-        query_states.dtype
-    )
-    attn_output = torch.matmul(attn_weights, value_states)
-
-    if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-        raise ValueError(
-            f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-            f" {attn_output.size()}"
-        )
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
-    if self.config.pretraining_tp > 1:
-        attn_output = attn_output.split(
-            self.hidden_size // self.config.pretraining_tp, dim=2
-        )
-        o_proj_slices = self.o_proj.weight.split(
-            self.hidden_size // self.config.pretraining_tp, dim=1
-        )
-        attn_output = sum(
-            [
-                F.linear(attn_output[i], o_proj_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-        )
-    else:
-        attn_output = self.o_proj(attn_output)
+    attn_output = self.o_proj(attn_output)
 
-    if not output_attentions:
-        attn_weights = None
-
-    return attn_output, attn_weights, past_key_value
+    return attn_output, None, past_key_value
 
 def llama_model_forward(
     self,
@@ -325,7 +257,7 @@ def main(args):
         global decode_one_token, prefill
         # tofix: reduce-overhead did not work in a multi-GPU setting
         if torch.cuda.device_count() > 1:
-            print("Compile decode with defualt mode")
+            print("Compile decode with default mode")
             decode_one_token = torch.compile(decode_one_token)
         else:
             print("Compile decode with reduce-overhead mode and full-graph")
