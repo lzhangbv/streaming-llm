@@ -4,7 +4,7 @@ Accelerate LLM Inference with torch.compile
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
@@ -16,35 +16,45 @@ import types
 import os
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
-# prepare causal mask and past_key_values with setup_caches
-causal_mask = None
-past_key_values = None
-
-def setup_caches(max_batch_size, config):
-    num_layers = config.num_hidden_layers
+def setup_llama_model(model, max_batch_size=1): 
+    config = model.config
     n_heads = config.num_key_value_heads
     head_dim = config.hidden_size // config.num_attention_heads
     max_seq_length = config.max_position_embeddings
-    dtype = torch.bfloat16 if config.torch_dtype == "bfloat16" else torch.float16
-
-    global causal_mask, past_key_values
     cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
-    past_key_values = [
-        (torch.zeros(cache_shape, dtype=dtype), torch.zeros(cache_shape, dtype=dtype)) for _ in range(num_layers)
-    ]
-    
-    cond = torch.tril(torch.ones(max_seq_length, max_seq_length, dtype=torch.bool))
-    causal_mask = torch.full((max_seq_length, max_seq_length), torch.finfo(dtype).min)
-    causal_mask.masked_fill_(cond, 0)
+
+    for name, module in model.named_modules(): 
+        if "attn" in name and "attn." not in name:
+            # replace llama attention foward
+            module.forward = types.MethodType(llama_attention_forward, module)
+            # prepare past key value
+            dtype = module.o_proj.weight.data.dtype
+            device = module.o_proj.weight.data.device
+            module.past_key_value = (
+                torch.zeros(cache_shape, dtype=dtype, device=device), 
+                torch.zeros(cache_shape, dtype=dtype, device=device)
+            )
+
+        if "model" in name and "model." not in name:
+            # replace llama model forward
+            module.forward = types.MethodType(llama_model_forward, module)
+            # prepare causal mask
+            dtype = module.embed_tokens.weight.data.dtype
+            device = module.embed_tokens.weight.data.device
+            print(f"token embed dtype: {dtype}, device: {device}")
+            cond = torch.tril(torch.ones((max_seq_length, max_seq_length), dtype=torch.bool, device=device))
+            causal_mask = torch.full((max_seq_length, max_seq_length), torch.finfo(dtype).min, device=device)
+            causal_mask.masked_fill_(cond, 0)
+            module.causal_mask = causal_mask
 
 def llama_attention_forward(
     self,
-    hidden_states, 
-    attention_mask,  
-    position_ids, 
-    past_key_value,  
-    output_attentions,  
-    use_cache
+    hidden_states,
+    attention_mask=None,
+    position_ids=None,
+    past_key_value=None,  
+    output_attentions=False,  
+    use_cache=False,
 ):
     bsz, q_len, _ = hidden_states.size()
 
@@ -91,21 +101,21 @@ def llama_attention_forward(
         bsz, q_len, self.num_key_value_heads, self.head_dim
     ).transpose(1, 2)
 
-    kv_seq_len = self.max_position_embeddings # use static shape
+    kv_seq_len = self.max_position_embeddings # static shape
     cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-    if past_key_value is not None:
+    if self.past_key_value is not None:
         # update past key value: [bsz, n_heads, seq_length, head_dim]
-        past_key_value[0][:, :, position_ids[0]] = key_states
-        past_key_value[1][:, :, position_ids[0]] = value_states
+        self.past_key_value[0][:, :, position_ids[0]] = key_states
+        self.past_key_value[1][:, :, position_ids[0]] = value_states
 
         # use all KVs (future KVs will be masked out)
-        key_states = past_key_value[0]
-        value_states = past_key_value[1]
+        key_states = self.past_key_value[0]
+        value_states = self.past_key_value[1]
 
-    past_key_value = (past_key_value[0], past_key_value[1]) if use_cache else None
+    past_key_value = (key_states, value_states) if use_cache else None
 
     # repeat k/v heads if n_kv_heads < n_heads
     key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -122,9 +132,7 @@ def llama_attention_forward(
             f" {attn_weights.size()}"
         )
 
-    # causal mask
-    if causal_mask is not None: 
-        attention_mask = causal_mask[None, None, position_ids[0]]
+    if attention_mask is not None:
         if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
             raise ValueError(
                 f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
@@ -169,15 +177,15 @@ def llama_attention_forward(
 
 def llama_model_forward(
     self,
-    input_ids, 
-    attention_mask,  
-    position_ids, 
-    past_key_values,  
-    inputs_embeds, 
-    use_cache, 
-    output_attentions, 
-    output_hidden_states,
-    return_dict,
+    input_ids=None, 
+    attention_mask=None,  
+    position_ids=None, 
+    past_key_values=None, 
+    inputs_embeds=None, 
+    use_cache=None, 
+    output_attentions=None, 
+    output_hidden_states=None, 
+    return_dict=None, 
 ):
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
@@ -192,24 +200,27 @@ def llama_model_forward(
 
     # embed positions
     hidden_states = inputs_embeds
+    
+    # attention mask (todo: consider token mask in the pad mode)
+    attention_mask = self.causal_mask[None, None, position_ids[0]]
+
+    # past key values are not used here
+    past_key_values = None
 
     # decoder layers
     all_hidden_states = () if output_hidden_states else None
     all_self_attns = () if output_attentions else None
     next_decoder_cache = () if use_cache else None
 
-    for idx, decoder_layer in enumerate(self.layers):
+    for decoder_layer in self.layers:
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-
-        past_key_value = past_key_values[idx] if past_key_values is not None else None
-
 
         layer_outputs = decoder_layer(
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_value=past_key_values, 
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
@@ -238,32 +249,19 @@ def llama_model_forward(
         attentions=all_self_attns,
     )
 
-def replace_llama_attention_forward(model):
-    for name, module in model.named_modules():
-        if "attn" in name and "attn." not in name:
-            module.forward = types.MethodType(llama_attention_forward, module)
-        if "model" in name and "model." not in name:
-            module.forward = types.MethodType(llama_model_forward, module)
-
-def prefill(model, input_ids, position_ids, past_key_values):
+def prefill(model, input_ids, position_ids):
     outputs = model(
         input_ids=input_ids,
         position_ids=position_ids,
-        past_key_values=past_key_values,
-        use_cache=True,
     )
-    # past_key_values = outputs.past_key_values
     idx_next = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
     return idx_next
 
-def decode_one_token(model, input_ids, position_ids, past_key_values):
+def decode_one_token(model, input_ids, position_ids):
     outputs = model(
         input_ids=input_ids,
         position_ids=position_ids,
-        past_key_values=past_key_values,
-        use_cache=True,
     )
-    # past_key_values = outputs.past_key_values
     idx_next = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
     return idx_next
 
@@ -281,55 +279,68 @@ def generate(model, input_ids, max_new_tokens):
     position_ids = torch.arange(0, T, dtype=torch.long, device=device)
     position_ids = position_ids.unsqueeze(0).view(-1, T) #[1, T]
 
-    next_token = prefill(model, input_ids, position_ids, past_key_values)
+    next_token = prefill(model, input_ids, position_ids)
     seq[T] = next_token[0]
 
     position_ids = torch.arange(T, T+1, dtype=torch.long, device=device)
     position_ids = position_ids.unsqueeze(0).view(-1, 1) #[1, 1]
 
     for i in range(1, max_new_tokens):
-        next_token = decode_one_token(model, next_token, position_ids, past_key_values)
+        next_token = decode_one_token(model, next_token, position_ids)
         seq[T+i] = next_token[0]
         position_ids += 1
     return seq
 
 def main(args):
+    # load model
     print("Loading model ...")
     t0 = time.time()
-    model = AutoModelForCausalLM.from_pretrained(args.model_id, device_map="auto", torch_dtype="auto")
+    config = AutoConfig.from_pretrained(args.model_id)
+    if args.max_position_embeddings is not None:
+        config.max_position_embeddings = args.max_position_embeddings
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_id, 
+        config=config,
+        device_map="auto", 
+        torch_dtype="auto",
+        )
     model.eval()
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
+    print('# of gpus: ', torch.cuda.device_count())
+    #print('device map: ', model.hf_device_map)
+
+    # setup model
+    setup_llama_model(model, max_batch_size=1)
 
     # prompt
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     prompt = "What is deep learning?"
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids
     input_ids = input_ids.to(model.device)
-    print(f"Prompt length: {input_ids.shape[1]}")
-
-    # replace attention
-    replace_llama_attention_forward(model)
-
-    # setup caches
-    device, dtype = input_ids.device, input_ids.dtype
-    with torch.device(device):
-        setup_caches(max_batch_size=1, config=model.config)
+    print(f"Prompt length: {input_ids.shape[1]}")  
 
     torch.manual_seed(1234)
     if args.compile:
-        # torch.compile optimization
         global decode_one_token, prefill
-        decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
+        # tofix: reduce-overhead did not work in a multi-GPU setting
+        if torch.cuda.device_count() > 1:
+            print("Compile decode with defualt mode")
+            decode_one_token = torch.compile(decode_one_token)
+        else:
+            print("Compile decode with reduce-overhead mode and full-graph")
+            decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
 
         if args.compile_prefill:
-            prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
+            # tofix: dynamic mode did not work
+            #prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
+            prefill = torch.compile(prefill)
     
     tokens_per_sec = []
     start = -1
 
     for i in range(start, args.num_samples): 
         torch.cuda.synchronize()
-        
         t0 = time.time()
 
         y = generate(
@@ -344,7 +355,8 @@ def main(args):
 
         torch.cuda.synchronize()
         t = time.time() - t0
-        print(tokenizer.decode(y.tolist()))
+        print("\n")
+        print(tokenizer.decode(y.tolist(), skip_special_tokens=True))
 
         tokens_sec = args.max_new_tokens / t
         tokens_per_sec.append(tokens_sec)
@@ -360,6 +372,7 @@ if __name__ == "__main__":
     parser.add_argument("--compile_prefill", action="store_true")
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--max_new_tokens", type=int, default=200)
+    parser.add_argument("--max_position_embeddings", type=int, default=None)
     args = parser.parse_args()
     print(args)
     main(args)

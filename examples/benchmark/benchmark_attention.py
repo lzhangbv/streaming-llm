@@ -117,7 +117,7 @@ for x in range(args.num_iters + 1):
     benchmark_step(model, input_ids, max_gen_len)
     t = time.time() - stime
     iter_times.append(t)
-    tokens_per_sec.append(max_gen_len/t)
+    tokens_per_sec.append(args.bs*max_gen_len/t)
     print('Iter #%d: %.3f seconds, %.3f tokens/second' % (x, iter_times[-1], tokens_per_sec[-1]))
 
 iter_times = iter_times[1:]
