@@ -30,10 +30,7 @@ def setup_llama_model(model, max_batch_size=1):
             # prepare past key value
             dtype = module.o_proj.weight.data.dtype
             device = module.o_proj.weight.data.device
-            module.past_key_value = (
-                torch.zeros(cache_shape, dtype=dtype, device=device), 
-                torch.zeros(cache_shape, dtype=dtype, device=device)
-            )
+            module.past_key_value = KVCache(cache_shape, dtype, device)
 
         if "model" in name and "model." not in name:
             # replace llama model forward
@@ -45,6 +42,19 @@ def setup_llama_model(model, max_batch_size=1):
             module.causal_mask = torch.tril(
                 torch.ones((max_seq_length, max_seq_length), dtype=torch.bool, device=device)
             )
+
+class KVCache(nn.Module):
+    def __init__(self, cache_shape, dtype, device):
+        super().__init__()
+        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype, device=device))
+        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype, device=device))
+
+    def update(self, input_pos, k_val, v_val):
+        k_out = self.k_cache
+        v_out = self.v_cache
+        k_out[:, :, input_pos] = k_val
+        v_out[:, :, input_pos] = v_val
+        return k_out, v_out
 
 def llama_attention_forward(
     self,
@@ -77,13 +87,8 @@ def llama_attention_forward(
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     if self.past_key_value is not None:
-        # update past key value: [bsz, n_heads, seq_length, head_dim]
-        self.past_key_value[0][:, :, position_ids[0]] = key_states
-        self.past_key_value[1][:, :, position_ids[0]] = value_states
-
-        # use all KVs (future KVs will be masked out)
-        key_states = self.past_key_value[0]
-        value_states = self.past_key_value[1]
+        # update current KVs and use all KVs (future KVs will be masked out)
+        key_states, value_states = self.past_key_value.update(position_ids[0], key_states, value_states)
 
     past_key_value = (key_states, value_states) if use_cache else None
 
@@ -267,18 +272,11 @@ def main(args):
     torch.manual_seed(1234)
     if args.compile:
         global decode_one_token, prefill
-        # tofix: reduce-overhead did not work in a multi-GPU setting
-        if torch.cuda.device_count() > 1:
-            print("Compile decode with default mode")
-            decode_one_token = torch.compile(decode_one_token)
-        else:
-            print("Compile decode with reduce-overhead mode and full-graph")
-            decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
+        fullgraph = not torch.cuda.device_count() > 1
+        decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=fullgraph)
 
         if args.compile_prefill:
-            # tofix: dynamic mode did not work
-            #prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
-            prefill = torch.compile(prefill)
+            prefill = torch.compile(prefill, dynamic=True, fullgraph=fullgraph)
     
     tokens_per_sec = []
     start = -1
