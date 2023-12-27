@@ -186,16 +186,14 @@ def prefill(model, input_ids, position_ids):
         input_ids=input_ids,
         position_ids=position_ids,
     )
-    idx_next = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-    return idx_next
+    return outputs
 
 def decode_one_token(model, input_ids, position_ids):
     outputs = model(
         input_ids=input_ids,
         position_ids=position_ids,
     )
-    idx_next = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-    return idx_next
+    return outputs
 
 @torch.no_grad()
 def generate(model, input_ids, max_new_tokens):
@@ -211,14 +209,16 @@ def generate(model, input_ids, max_new_tokens):
     position_ids = torch.arange(0, T, dtype=torch.long, device=device)
     position_ids = position_ids.unsqueeze(0).view(-1, T) #[1, T]
 
-    next_token = prefill(model, input_ids, position_ids)
+    outputs = prefill(model, input_ids, position_ids)
+    next_token = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
     seq[T] = next_token[0]
 
     position_ids = torch.arange(T, T+1, dtype=torch.long, device=device)
     position_ids = position_ids.unsqueeze(0).view(-1, 1) #[1, 1]
 
     for i in range(1, max_new_tokens):
-        next_token = decode_one_token(model, next_token, position_ids)
+        outputs = decode_one_token(model, next_token, position_ids)
+        next_token = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
         seq[T+i] = next_token[0]
         position_ids += 1
     return seq
@@ -231,19 +231,31 @@ def main(args):
     if args.max_position_embeddings is not None:
         config.max_position_embeddings = args.max_position_embeddings
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id, 
-        config=config,
-        device_map="auto", 
-        torch_dtype="auto",
-        )
-    model.eval()
+    if args.gpt_fast:
+        from gpt_fast import load_model
+        from pathlib import Path
+        checkpoint_path = Path(os.path.join(args.model_id, "model.pth"))
+        model = load_model(checkpoint_path, device='cuda')
+        model.device = 'cuda'
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id, 
+            config=config,
+            device_map="auto", 
+            torch_dtype="auto",
+            )
+        model.eval()
+
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
     print('# of gpus: ', torch.cuda.device_count())
     #print('device map: ', model.hf_device_map)
 
     # setup model
-    setup_llama_model(model, max_batch_size=1)
+    if args.gpt_fast:
+        with torch.device('cuda'):
+            model.setup_caches(max_batch_size=1, max_seq_length=config.max_position_embeddings)
+    else:
+        setup_llama_model(model, max_batch_size=1)
 
     # prompt
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
@@ -302,6 +314,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_id", type=str)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--compile_prefill", action="store_true")
+    parser.add_argument("--gpt_fast", action="store_true")
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--max_new_tokens", type=int, default=200)
     parser.add_argument("--max_position_embeddings", type=int, default=None)
