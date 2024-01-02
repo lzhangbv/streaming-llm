@@ -1,5 +1,5 @@
 """
-Accelerate LLM Inference with torch.compile, supporting HF-style batching with left-side padding. 
+Accelerate LLM inference with torch.compile and support HF-style batching with left-side padding. 
 """
 import torch
 import torch.nn as nn
