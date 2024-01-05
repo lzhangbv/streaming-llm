@@ -13,7 +13,8 @@ device = "cuda"
 args = parse_args()
 print(args)
 
-data = load_dataset(args.dataset_name, args.task, split=args.split)
+# You can use 'script' revision to load wikitext dataset if having network problems. 
+data = load_dataset(args.dataset_name, args.task, split=args.split, revision=args.revision)
 
 model, tokenizer = load(args.model_name_or_path, factor=args.scaling_factor)
 rwkv = "rwkv" in args.model_name_or_path
@@ -81,6 +82,14 @@ elif args.enable_pos_inf:
         from streaming_llm.pos_shift.modify_llama import enable_llama_pos_inf_attention
 
         enable_llama_pos_inf_attention(model, args.start_size, args.recent_size)
+    else:
+        raise ValueError(f"got {model.config.model_type}")
+elif args.enable_rerope:
+    assert not args.enable_start_recent_kv_cache
+    if "llama" in model.config.model_type:
+        from streaming_llm.pos_shift.modify_llama import enable_llama_rerope_attention
+
+        enable_llama_rerope_attention(model)
     else:
         raise ValueError(f"got {model.config.model_type}")
 elif args.enable_xformers:

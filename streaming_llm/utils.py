@@ -50,6 +50,7 @@ def parse_args():
     parser.add_argument("--enable_pos_shift", action="store_true")
     parser.add_argument("--enable_pos_abs", action="store_true")
     parser.add_argument("--enable_pos_inf", action="store_true")
+    parser.add_argument("--enable_rerope", action="store_true")
     parser.add_argument("--enable_xformers", action="store_true")
     parser.add_argument("--enable_blockwise_attention", action="store_true")
     parser.add_argument("--enable_kmeans_attention", action="store_true")
