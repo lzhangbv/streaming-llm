@@ -1,6 +1,10 @@
 """
-Experimental: Remote Attention for Long-context LLM Inference. 
+Experimental: Remote Attention for Long-context LLM Inference
+1. Local attention: model_device="cuda:0" and kv_cache_device="cuda:0"
+2. Remote attention: model_device="cuda:0" and kv_cache_device="cuda:1"
+3. HF-style pipeline parallelism: model_device="auto" and kv_cache_device="auto"
 """
+
 import types
 import torch
 import torch.nn as nn
@@ -19,8 +23,11 @@ def set_remote_attention(model, max_seq_length=2048, device="cuda:0", dtype=torc
         if "attn" in name and "attn." not in name:
             # replace llama attention foward
             module.forward = types.MethodType(llama_attention_forward, module)
-            module.k_cache = torch.zeros(cache_shape, dtype=dtype, device=device)
-            module.v_cache = torch.zeros(cache_shape, dtype=dtype, device=device)
+            # prepare static kv cache
+            kv_device =  module.o_proj.weight.data.device if device == "auto" else device
+            module.k_cache = torch.zeros(cache_shape, dtype=dtype, device=kv_device)
+            module.v_cache = torch.zeros(cache_shape, dtype=dtype, device=kv_device)
+            module.max_position_embeddings = max_seq_length
     
         if "model" in name and "model." not in name:
             # replace llama model forward
@@ -62,6 +69,7 @@ def llama_attention_forward(
         # prefill
         self.k_cache[:, :, :q_len] = key_states
         self.v_cache[:, :, :q_len] = value_states
+        # todo: compute prefill attention locally and overlap with kv cache transfer
         key_states = self.k_cache[:, :, :q_len]
         value_states = self.v_cache[:, :, :q_len]
     else:
@@ -78,7 +86,7 @@ def llama_attention_forward(
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-    # SDPA
+    # SDPA: avoid explicit attention mask
     if q_len > 1:
         # prefill
         attn_output = F.scaled_dot_product_attention(
@@ -182,6 +190,10 @@ def llama_model_forward(
         all_hidden_states += (hidden_states,)
 
     next_cache = next_decoder_cache if use_cache else None
+
+    # get last token's hidden state to reduce lm_head computation and memory overheads
+    hidden_states = hidden_states[:, -1, :].unsqueeze(1)
+
     if not return_dict:
         return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
     return BaseModelOutputWithPast(
