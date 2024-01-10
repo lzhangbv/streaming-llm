@@ -27,22 +27,26 @@ def parse_args():
     # bnb quantization
     parser.add_argument("--load_in_8bit", action="store_true")
     parser.add_argument("--load_in_4bit", action="store_true")
+    # remote attention
+    parser.add_argument("--remote_attention", action="store_true")
+    parser.add_argument("--model_device", type=str, default="auto")
+    parser.add_argument("--kv_cache_device", type=str, default="auto")
 
     args = parser.parse_args()
     return args
 
-def load(model_name_or_path):
-    print(f"Loading model from {model_name_or_path} ...")
-    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+def load(args):
+    print(f"Loading model from {args.model_name_or_path} ...")
+    config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
-    if "llama-32k" in model_name_or_path: 
+    if "llama-32k" in args.model_name_or_path: 
         # disable modeling_flash_llama 
         config.auto_map = {}
     
     model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
+        args.model_name_or_path,
         config=config,
-        device_map="auto",
+        device_map=args.model_device,
         torch_dtype=torch.float16,
         trust_remote_code=True,
         use_flash_attention_2=args.enable_flash,
@@ -74,15 +78,27 @@ def benchmark_step(model, input_ids, max_gen_len):
             use_cache=use_cache,
         )
         past_key_values = outputs.past_key_values
+    
+    if not use_cache:
+        bsz = input_ids.size()[0]
+        output_ids = input_ids.new_zeros((bsz, prompt_length +  max_gen_len))
 
     # generate
     pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-    for _ in range(max_gen_len - 1):
-        outputs = model(
-            input_ids=pred_token_idx,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-        )
+    for i in range(1, max_gen_len):
+        if use_cache:
+            outputs = model(
+                input_ids=pred_token_idx,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+            )
+        else:
+            outputs = model(
+                input_ids=output_ids[:, :prompt_length+i],
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+            )
+
         past_key_values = outputs.past_key_values
             
         pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
@@ -92,7 +108,7 @@ device = "cuda"
 args = parse_args()
 print(args)
 
-config, model = load(args.model_name_or_path)
+config, model = load(args)
 vocab_size=config.vocab_size
 assert "llama" in model.config.model_type
 assert not (args.no_cache and args.chunk_infer) 
@@ -106,6 +122,9 @@ elif args.enable_kmeans_v2:
 elif args.enable_xformers:
     from streaming_llm.pos_shift.modify_llama import enable_llama_xops_attention
     enable_llama_xops_attention(model)
+elif args.remote_attention:
+    from remote_attention import set_remote_attention
+    set_remote_attention(model, device=args.kv_cache_device, max_seq_length=args.input+args.output)
 
 input_ids = torch.randint(0, vocab_size-1, (args.bs, args.input), dtype=torch.long)
 max_gen_len = args.output
