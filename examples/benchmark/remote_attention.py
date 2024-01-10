@@ -12,12 +12,14 @@ from torch.nn import functional as F
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
-def set_remote_attention(model, max_seq_length=2048, device="cuda:0", dtype=torch.float16):
+def set_remote_attention(model, max_seq_length=2048, device="cuda:0", dtype=torch.float16, overlap=True):
     config = model.config
     n_heads = config.num_key_value_heads
     head_dim = config.hidden_size // config.num_attention_heads
     # it only supports bs=1
     cache_shape = (1, n_heads, max_seq_length, head_dim)
+    # overlap prefill kv cache data transfer
+    transfer_stream = torch.cuda.Stream() if overlap else None
 
     for name, module in model.named_modules(): 
         if "attn" in name and "attn." not in name:
@@ -28,11 +30,13 @@ def set_remote_attention(model, max_seq_length=2048, device="cuda:0", dtype=torc
             module.k_cache = torch.zeros(cache_shape, dtype=dtype, device=kv_device)
             module.v_cache = torch.zeros(cache_shape, dtype=dtype, device=kv_device)
             module.max_position_embeddings = max_seq_length
+            module.transfer_stream = transfer_stream
     
         if "model" in name and "model." not in name:
             # replace llama model forward
             module.forward = types.MethodType(llama_model_forward, module)
             module.kv_length = 0
+            module.transfer_stream = transfer_stream
     
 def llama_attention_forward(
     self,
@@ -66,21 +70,23 @@ def llama_attention_forward(
     
     # update remote kv cache
     if q_len > 1:
-        # prefill
-        self.k_cache[:, :, :q_len] = key_states
-        self.v_cache[:, :, :q_len] = value_states
-        # todo: compute prefill attention locally and overlap with kv cache transfer
-        key_states = self.k_cache[:, :, :q_len]
-        value_states = self.v_cache[:, :, :q_len]
+        # prefill: compute attention locally
+        if self.transfer_stream is not None:
+            # overlap with kv cache data transfer
+            self.transfer_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.transfer_stream):
+                self.k_cache[:, :, :q_len] = key_states
+                self.v_cache[:, :, :q_len] = value_states
+        else:
+            self.k_cache[:, :, :q_len] = key_states
+            self.v_cache[:, :, :q_len] = value_states
     else:
-        # decode
+        # decode: compute attention remotely
         pos_id = position_ids[0].item()
         self.k_cache[:, :, pos_id:pos_id+1] = key_states
         self.v_cache[:, :, pos_id:pos_id+1] = value_states
         key_states = self.k_cache[:, :, :pos_id+1]
         value_states = self.v_cache[:, :, :pos_id+1]
-
-    past_key_value = (key_states, value_states) if use_cache else None
 
     # repeat k/v heads if n_kv_heads < n_heads
     key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -90,7 +96,7 @@ def llama_attention_forward(
     if q_len > 1:
         # prefill
         attn_output = F.scaled_dot_product_attention(
-            query_states.to(key_states.device), 
+            query_states, 
             key_states, 
             value_states, 
             attn_mask=None, 
@@ -105,14 +111,13 @@ def llama_attention_forward(
             value_states, 
             attn_mask=None, 
             dropout_p=0.0,
-        )
+        ).to(hidden_states.device)
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-    attn_output = attn_output.to(hidden_states.device)
 
     attn_output = self.o_proj(attn_output)
-    return attn_output, None, past_key_value
+    return attn_output, None, None
 
 def llama_model_forward(
     self,
@@ -141,8 +146,8 @@ def llama_model_forward(
     hidden_states = inputs_embeds
 
     # position ids
+    q_len = inputs_embeds.shape[1]
     if position_ids is None:
-        q_len = inputs_embeds.shape[1]
         if q_len > 1:
             # prefill
             position_ids = torch.arange(0, q_len, dtype=torch.long, device=hidden_states.device)
@@ -193,6 +198,10 @@ def llama_model_forward(
 
     # get last token's hidden state to reduce lm_head computation and memory overheads
     hidden_states = hidden_states[:, -1, :].unsqueeze(1)
+
+    # synchronize the data transfer operations in the prefill phase
+    if q_len > 1 and self.transfer_stream is not None:
+        torch.cuda.current_stream().wait_stream(self.transfer_stream)
 
     if not return_dict:
         return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
