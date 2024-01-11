@@ -11,6 +11,8 @@ def parse_args():
     parser.add_argument("--output", type=int, default=32)
     parser.add_argument("--bs", type=int, default=1)
     parser.add_argument("--num_iters", type=int, default=5)
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--memory_snapshot", action="store_true")
     # kmeans params
     parser.add_argument("--enable_kmeans", action="store_true")
     parser.add_argument("--enable_kmeans_v2", action="store_true")
@@ -129,6 +131,12 @@ elif args.remote_attention:
 input_ids = torch.randint(0, vocab_size-1, (args.bs, args.input), dtype=torch.long)
 max_gen_len = args.output
 
+if args.memory_snapshot:
+    torch.cuda.memory._record_memory_history(max_entries=100000)
+    benchmark_step(model, input_ids, max_gen_len=6)
+    torch.cuda.memory._dump_snapshot("snapshot.pickle") # open it at https://pytorch.org/memory_viz
+    torch.cuda.memory._record_memory_history(enabled=None)
+
 iter_times = []
 tokens_per_sec = []
 for x in range(args.num_iters + 1):
@@ -145,4 +153,10 @@ tokens_per_sec = tokens_per_sec[1:]
 # Results
 print('Iteraction time: %.3f +-%.3f seconds' % (np.mean(iter_times), 1.96*np.std(iter_times)))
 print('Throughput: %.3f +-%.3f tokens/second' % (np.mean(tokens_per_sec), 1.96*np.std(tokens_per_sec)))
+
+if args.profile:
+    prof = torch.profiler.profile()
+    with prof:
+        benchmark_step(model, input_ids, max_gen_len)
+    prof.export_chrome_trace("profile.json") # open it at chrome://tracing
 

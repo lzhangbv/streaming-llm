@@ -334,6 +334,12 @@ def main(args):
     print(f"Average tokens/sec: {torch.mean(torch.tensor(tokens_per_sec)).item():.2f}")
     print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
+    if args.profile:
+        prof = torch.profiler.profile()
+        with prof:
+            generate(model, inputs, token_mask, args.max_new_tokens)
+        prof.export_chrome_trace("profile.json")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_id", type=str)
@@ -343,6 +349,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=200)
     parser.add_argument("--max_batch_size", type=int, default=None)
     parser.add_argument("--max_position_embeddings", type=int, default=None)
+    parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
     print(args)
     main(args)
