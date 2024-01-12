@@ -1,5 +1,5 @@
 """
-Experimental: Remote Attention for Long-context LLM Inference
+Experimental: Remote Attention for Long-context LLM Inference with memory optimizations
 1. Local attention: model_device="cuda:0" and kv_cache_device="cuda:0"
 2. Remote attention: model_device="cuda:0" and kv_cache_device="cuda:1"
 3. HF-style pipeline parallelism: model_device="auto" and kv_cache_device="auto"
@@ -9,10 +9,10 @@ import types
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
+from transformers.models.llama.modeling_llama import repeat_kv, rotate_half
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
-def set_remote_attention(model, max_seq_length=2048, device="cuda:0", dtype=torch.float16, overlap=True):
+def set_remote_attention(model, max_seq_length=2048, device="cuda:0", dtype=torch.float16, overlap=False):
     config = model.config
     n_heads = config.num_key_value_heads
     head_dim = config.hidden_size // config.num_attention_heads
@@ -31,13 +31,35 @@ def set_remote_attention(model, max_seq_length=2048, device="cuda:0", dtype=torc
             module.v_cache = torch.zeros(cache_shape, dtype=dtype, device=kv_device)
             module.max_position_embeddings = max_seq_length
             module.transfer_stream = transfer_stream
+        
+        if "mlp" in name and "mlp." not in name:
+            # replace llama mlp forward
+            module.forward = types.MethodType(llama_mlp_forward, module)
     
         if "model" in name and "model." not in name:
             # replace llama model forward
             module.forward = types.MethodType(llama_model_forward, module)
             module.kv_length = 0
             module.transfer_stream = transfer_stream
-    
+
+def llama_mlp_forward(self, x):
+    # reduce mlp actication cost
+    gate = self.gate_proj(x)
+    act = self.act_fn(gate)
+    del gate
+    up = self.up_proj(x)
+    del x
+    up.mul_(act)
+    del act
+    down = self.down_proj(up)
+    return down
+
+def apply_rotary_pos_emb_single(x, cos, sin): 
+    x_cos = x * cos
+    x_sin = rotate_half(x) * sin
+    x_cos.add_(x_sin)
+    return x_cos
+
 def llama_attention_forward(
     self,
     hidden_states,
@@ -63,11 +85,14 @@ def llama_attention_forward(
         bsz, q_len, self.num_key_value_heads, self.head_dim
     ).transpose(1, 2)
 
-    kv_seq_len = self.max_position_embeddings # static shape
+    # RoPE
+    kv_seq_len = self.max_position_embeddings
     cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    cos = cos[position_ids].unsqueeze(1)
+    sin = sin[position_ids].unsqueeze(1)
+    query_states = apply_rotary_pos_emb_single(query_states, cos, sin)
+    key_states = apply_rotary_pos_emb_single(key_states, cos, sin)
 
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-    
     # update remote kv cache
     if q_len > 1:
         # prefill: compute attention locally
@@ -200,7 +225,7 @@ def llama_model_forward(
     hidden_states = hidden_states[:, -1, :].unsqueeze(1)
 
     # synchronize the data transfer operations in the prefill phase
-    if q_len > 1 and self.transfer_stream is not None:
+    if q_len > 1 and self.transfer_stream is not None: 
         torch.cuda.current_stream().wait_stream(self.transfer_stream)
 
     if not return_dict:
