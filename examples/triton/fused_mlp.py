@@ -58,7 +58,13 @@ def matmul_silu_kernel(
 
     # -----------------------------------------------------------
     # Fuse silu activation function
+    # option 1: all in fp32
     c = (acc1 * tl.sigmoid(acc1)) * acc2
+
+    # option 2: silu in fp32
+    #acc1 = (acc1 * tl.sigmoid(acc1)).to(tl.float16)
+    #acc2 = acc2.to(tl.float16)
+    #c = acc1 * acc2
 
     # -----------------------------------------------------------
     # Write back the block of the output matrix
@@ -84,7 +90,7 @@ def matmul_silu(x, w1, w2):
     x = x.view(M, K)
 
     # Allocates output.
-    out = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
 
     # 1D launch kernel where each block gets its own program.
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
@@ -110,14 +116,13 @@ def torch_matmul_silu(x, w1, w2):
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    a = torch.randn((1, 64, 4096), device='cuda', dtype=torch.float16)
-    w1 = torch.randn((4096, 11008), device='cuda', dtype=torch.float16) * 0.2
-    w2 = torch.randn((4096, 11008), device='cuda', dtype=torch.float16) * 0.2
+    a = torch.randn((1, 16, 4096), device='cuda', dtype=torch.float16)
+    w1 = torch.randn((4096, 11008), device='cuda', dtype=torch.float16) * 0.01
+    w2 = torch.randn((4096, 11008), device='cuda', dtype=torch.float16) * 0.01
     triton_output = matmul_silu(a, w1, w2)
     torch_output = torch_matmul_silu(a, w1, w2)
     print(f"triton_output={triton_output}")
     print(f"torch_output={torch_output}")
     print(f'The maximum difference between torch and triton is '
         f'{torch.max(torch.abs(torch_output - triton_output))}')
-
 
