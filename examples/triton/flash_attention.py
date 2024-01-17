@@ -17,9 +17,9 @@ def _flash_attention_kernel(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    cur_batch = tl.program_id(0)
-    cur_head = tl.program_id(1)
-    start_m = tl.program_id(2)
+    start_m = tl.program_id(0)
+    cur_batch = tl.program_id(1)
+    cur_head = tl.program_id(2)
     
     cur_kv_head = cur_head // kv_group_num
 
@@ -108,7 +108,8 @@ def flash_attention(q, k, v, b_start_loc, b_seq_len, max_input_len):
     batch, head = b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1] # group query attention
     
-    grid = (batch, head, triton.cdiv(max_input_len, BLOCK))  # (batch, head, block_q)
+    # put block_q in the x dim to improve cache hit rate
+    grid = (triton.cdiv(max_input_len, BLOCK), batch, head)  # (block_q, batch, head)
 
     num_warps = 4 if Lk <= 64 else 8
     _flash_attention_kernel[grid](
@@ -134,9 +135,9 @@ def _naive_attention(q, k ,v):
     device = q.device
     mask = 1.0 - torch.tril(torch.ones((seqlen, seqlen), device=device), diagonal=0).unsqueeze(0).unsqueeze(0)
     mask.masked_fill_(mask.to(torch.bool), -100000000.0)
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
+    q = q.transpose(1, 2) #(bs, num_head, seqlen, head_dim)
+    k = k.transpose(1, 2) #(bs, num_head, seqlen, head_dim)
+    v = v.transpose(1, 2) #(bs, num_head, seqlen, head_dim)
     scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim)
     scores = torch.nn.functional.softmax(scores.float() + mask, dim=-1).to(q.dtype)
     output = torch.matmul(scores, v).transpose(1, 2).contiguous().reshape(bs, seqlen, num_head, head_dim)
@@ -144,9 +145,9 @@ def _naive_attention(q, k ,v):
 
 def _sdpa(q, k, v):
     bs, seqlen, num_head, head_dim = q.shape
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
+    q = q.transpose(1, 2) #(bs, num_head, seqlen, head_dim)
+    k = k.transpose(1, 2) #(bs, num_head, seqlen, head_dim)
+    v = v.transpose(1, 2) #(bs, num_head, seqlen, head_dim)
     output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
     output = output.transpose(1, 2).contiguous().reshape(bs, seqlen, num_head, head_dim)
     return output
@@ -170,7 +171,7 @@ def torch_attention(q, k, v, b_start_loc, b_seq_len, sdpa=True):
 if __name__ == "__main__":
     torch.manual_seed(0)
     # inputs
-    shape = (3 * 1024, 32, 128)
+    shape = (3 * 1024, 32, 128) #(ntoken, nhead, head_dim)
     dtype = torch.float16
     q = torch.randn(shape, device='cuda', dtype=dtype)
     k = torch.randn(shape, device='cuda', dtype=dtype)
