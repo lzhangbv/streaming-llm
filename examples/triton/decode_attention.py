@@ -44,17 +44,17 @@ def _attention_kernel(
     acc = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
     for start_n in range(0, cur_batch_seq_len, BLOCK):
         start_n = tl.multiple_of(start_n, BLOCK)
-        # -- compute qk ----
+        # -- compute qk --
         k = tl.load(k_ptrs, mask=(start_n + offs_n[:, None]) < cur_batch_seq_len, other=0.0)
-        qk = tl.sum(q[None, :] * k, 1)
+        qk = tl.sum(q[None, :] * k, 1) # use cudacore
         qk *= sm_scale
         qk = tl.where(start_n + offs_n < cur_batch_seq_len, qk, float("-inf"))
-        # -- online softmax
+        # -- online softmax --
         n_e_max = tl.maximum(tl.max(qk, 0), e_max)
         old_scale = tl.exp(e_max - n_e_max)
         p = tl.exp(qk - n_e_max)
         e_sum = e_sum * old_scale + tl.sum(p, 0)
-        # -- update output
+        # -- update output --
         v = tl.load(v_ptrs, mask=(start_n + offs_n[:, None]) < cur_batch_seq_len, other=0.0)
         acc = acc * old_scale + tl.sum(p[:, None] * v, 0)
         e_max = n_e_max
