@@ -184,4 +184,6 @@ if __name__ == "__main__":
     triton_output = flash_attention(q, k, v, b_start_loc, b_seq_len, max_input_len)
     torch_output = torch_attention(q, k, v, b_start_loc, b_seq_len, sdpa=False)
     print(f'The maximum difference between torch and triton is {torch.max(torch.abs(torch_output - triton_output))}')
-
+    # benchmark
+    print("torch:", triton.testing.do_bench(lambda: torch_attention(q, k, v, b_start_loc, b_seq_len, sdpa=False)))
+    print("triton:", triton.testing.do_bench(lambda: flash_attention(q, k, v, b_start_loc, b_seq_len, max_input_len)))

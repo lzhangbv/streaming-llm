@@ -71,3 +71,6 @@ if __name__ == "__main__":
     print(y_triton)
     print(f'The maximum difference between torch and triton is '
         f'{torch.max(torch.abs(y_torch - y_triton))}')
+    # benchmark
+    print('torch:', triton.testing.do_bench(lambda: torch_rmsnorm(x, w)))
+    print('triton:', triton.testing.do_bench(lambda: rmsnorm(x, w)))

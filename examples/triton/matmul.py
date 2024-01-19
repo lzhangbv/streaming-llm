@@ -143,4 +143,6 @@ if __name__ == "__main__":
     print(f"torch_output={torch_output}")
     print(f'The maximum difference between torch and triton is '
         f'{torch.max(torch.abs(torch_output - triton_output))}')
-
+    # benchmark
+    print('torch:', triton.testing.do_bench(lambda: torch.matmul(a, b)))
+    print('triton:', triton.testing.do_bench(lambda: matmul(a, b)))

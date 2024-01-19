@@ -149,4 +149,6 @@ if __name__ == "__main__":
     torch_output = torch_attention_with_kvcache(q, k_cache, v_cache, b_start_loc, b_seq_len)
     triton_output = attention_with_kvcache(q, k_cache, v_cache, b_start_loc, b_seq_len)
     print(f'The maximum difference between torch and triton is {torch.max(torch.abs(torch_output - triton_output))}')
-    
+    # benchmark
+    print('torch:', triton.testing.do_bench(lambda: torch_attention_with_kvcache(q, k_cache, v_cache, b_start_loc, b_seq_len)))
+    print('triton:', triton.testing.do_bench(lambda: attention_with_kvcache(q, k_cache, v_cache, b_start_loc, b_seq_len)))

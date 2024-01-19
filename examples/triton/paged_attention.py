@@ -160,3 +160,6 @@ if __name__ == "__main__":
     torch_output = torch_paged_attention(q, k_cache, v_cache, block_tables, seq_lens)
     triton_output = paged_attention(q, k_cache, v_cache, block_tables, seq_lens)
     print(f'The maximum difference between torch and triton is {torch.max(torch.abs(torch_output - triton_output))}')
+    # benchmark
+    print('torch:', triton.testing.do_bench(lambda: torch_paged_attention(q, k_cache, v_cache, block_tables, seq_lens)))
+    print('triton:', triton.testing.do_bench(lambda: paged_attention(q, k_cache, v_cache, block_tables, seq_lens)))
