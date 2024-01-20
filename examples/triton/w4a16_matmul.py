@@ -257,7 +257,7 @@ def torch_w4a16_matmul(x, qweight, scales, qzeros, group_size, sym=False):
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    M, N, K = 32, 4096, 4096
+    M, N, K = 1, 4096, 4096
     group_size = 128
 
     a = torch.randn((M, K), device='cuda', dtype=torch.float16)
