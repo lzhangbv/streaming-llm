@@ -196,8 +196,8 @@ def splitk_w4a16_matmul(x, qweight, scales, qzeros, group_size, sym=False):
     assert N % block_size_n == 0, "N must be a multiple of block_size_n"
     assert group_size % block_size_k == 0, "Group size must be a multiple of block_size_k"
 
-    # allocate output
-    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    # allocate zero output for atomic add
+    c = torch.zeros((M, N), device=x.device, dtype=x.dtype)
 
     grid = lambda META: (triton.cdiv(M, META['block_m']) * triton.cdiv(N, META['block_n']), META['split_k'])
 
