@@ -11,7 +11,7 @@ import triton.language as tl
 import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-def load_model(checkpoint, device='cuda'):
+def load_gptq_model(checkpoint, device='cuda'):
     # quant config
     quant_config = json.load(open(Path(checkpoint) / 'quantize_config.json'))
     wbits = quant_config['bits']
@@ -225,7 +225,7 @@ def w4a16_matmul(a, qweight, scales, qzeros, g_idx, group_size):
 if __name__ == "__main__":
     # load
     model_id = "/mnt/data/llama2-7b-chat-gptq/"
-    model = load_model(model_id)
+    model = load_gptq_model(model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     # test
     print("Testing ...")
