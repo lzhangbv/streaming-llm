@@ -1,6 +1,7 @@
 import math
 import json
 from pathlib import Path
+import time
 
 import torch
 import torch.nn as nn
@@ -40,6 +41,7 @@ def load_awq_model(checkpoint, device='cuda'):
     #print(model.state_dict().keys())
     # load checkpoint
     print('Loading model ...')
+    t0 = time.time()
     if (Path(checkpoint) / 'model.safetensors').exists():
         from safetensors.torch import load_file as safe_load
         checkpoint = safe_load(Path(checkpoint) / 'model.safetensors')
@@ -47,12 +49,15 @@ def load_awq_model(checkpoint, device='cuda'):
             if "rotary_emb.inv_freq" in name:
                 del checkpoint[name]
             if "qweight" in name:
-                checkpoint[name] = _convert_awq_qweight(checkpoint[name], wbits)
+                #checkpoint[name] = _convert_awq_qweight(checkpoint[name], wbits)
+                checkpoint[name] = _fast_convert_awq_qweight(checkpoint[name], wbits)
             if "qzeros" in name:
-                checkpoint[name] = _convert_awq_qzeros(checkpoint[name], wbits)
+                #checkpoint[name] = _convert_awq_qzeros(checkpoint[name], wbits)
+                checkpoint[name] = _fast_convert_awq_qzeros(checkpoint[name], wbits)
         model.load_state_dict(checkpoint, strict=False) #missing g_idx in checkpoints
     else:
         raise FileNotFoundError(f"Could not find model checkpoint at {checkpoint}; please ensure it contains a `model.safetensors` file.")
+    print(f"Time to load: {time.time()-t0:.02f}")
     # remove zero bias
     for name, m in model.named_modules():
         if isinstance(m, QuantLinear):
@@ -110,6 +115,35 @@ def _convert_awq_qzeros(awq_qzeros, bits=4):
             qzeros[:, col] |= zeros[:, j] << (bits * (j - i))
         i += 32 // bits
         col += 1
+    return qzeros
+
+def _fast_convert_awq_qweight(awq_qweight, bits=4):
+    assert bits == 4, "Only 4-bit AWQ is supported"
+    assert awq_qweight.dtype == torch.int32
+    # unpack
+    shifts = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], device=awq_qweight.device, dtype=torch.int32) * bits
+    iweight = torch.bitwise_right_shift(awq_qweight[:, :, None], shifts[None, None, :]).to(torch.int8)
+    iweight = iweight.view(iweight.shape[0], -1)
+    iweight = torch.bitwise_and(iweight, (2**bits) - 1)
+    # pack
+    shifts = torch.arange(0, 32, bits, device=iweight.device)
+    iweight = iweight.view(iweight.shape[0] // (32 // bits), 32 // bits, -1)
+    qweight = (torch.bitwise_left_shift(iweight, shifts[None, :, None]).sum(dim=1).to(torch.int32))
+    return qweight
+
+def _fast_convert_awq_qzeros(awq_qzeros, bits=4):
+    assert bits == 4, "Only 4-bit AWQ is supported"
+    assert awq_qzeros.dtype == torch.int32
+    # unpack
+    shifts = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], device=awq_qzeros.device, dtype=torch.int32) * bits
+    izeros = torch.bitwise_right_shift(awq_qzeros[:, :, None], shifts[None, None, :]).to(torch.int8)
+    izeros = izeros.view(izeros.shape[0], -1)
+    izeros = torch.bitwise_and(izeros, (2**bits) - 1)
+    # Note: we remove "izeros -= 1" as it could make big errors
+    # pack
+    shifts = torch.arange(0, 32, bits, device=izeros.device)
+    izeros = izeros.view(-1, izeros.shape[1] // (32 // bits), 32 // bits)
+    qzeros = (torch.bitwise_left_shift(izeros, shifts[None, None, :]).sum(dim=-1).to(torch.int32))
     return qzeros
 
 def make_quant(model, bits=4, groupsize=128):
