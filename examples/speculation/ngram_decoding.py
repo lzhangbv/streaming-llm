@@ -13,7 +13,7 @@ def parse_args():
     parser.add_argument('--max_new_tokens', type=int, default=1024)
     # ngram speculation
     parser.add_argument('--max_ngram_size', type=int, default=3)
-    parser.add_argument('--speculate_k', type=int, default=5)
+    parser.add_argument('--speculate_k', type=int, default=10)
     # support multi-turn chat
     parser.add_argument('--multi_turn', action="store_true") 
     
@@ -164,6 +164,7 @@ def main(args):
     tokenizer, model = load_model(args.model_name_or_path)
 
     accept_counts = []
+    accept_counts2 = []
     prompt = None
     for idx, user_prompt in enumerate(user_prompts):
         print("\n" + user_prompt)
@@ -182,7 +183,11 @@ def main(args):
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
         input_ids = input_ids.to(model.device)
         outputs, accept_count = generate(args, model, encoded=input_ids, eos_token_id=tokenizer.eos_token_id)
-        accept_counts.append(accept_count)
+
+        if args.multi_turn and idx % 2 == 1: 
+            accept_counts2.append(accept_count)
+        else:
+            accept_counts.append(accept_count)
         
         T = input_ids.shape[1]
         answer = tokenizer.decode(outputs[T:].tolist(), skip_special_tokens=True)
@@ -198,6 +203,11 @@ def main(args):
     print(f"Acceptance probs: {acceptance_probs}")
     print(f"Mean Accepted: {sum([idx * i for idx, i in enumerate(counts_aggregated)])/sum(counts_aggregated)}")
 
+    if args.multi_turn:
+        counts_aggregated = [sum(i) for i in zip(*accept_counts2)]
+        acceptance_probs = [i/sum(counts_aggregated) for i in counts_aggregated]
+        print(f"Second-turn acceptance probs: {acceptance_probs}")
+        print(f"Second-turn mean Accepted: {sum([idx * i for idx, i in enumerate(counts_aggregated)])/sum(counts_aggregated)}")
 
 if __name__ == '__main__':
     args = parse_args()
