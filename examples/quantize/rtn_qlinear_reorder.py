@@ -1,4 +1,5 @@
 import time
+import functools
 
 import torch
 import torch.nn as nn
@@ -7,11 +8,15 @@ import triton
 import triton.language as tl
 
 
-def fast_quant(W, bits=4, groupsize=128):
+def fast_quant_with_reorder(W, act_scale, bits=4, groupsize=128):
     N, K = W.shape
     assert bits == 4
     assert K % groupsize == 0
     assert N % 8 == 0
+    # reorder
+    perm = torch.argsort(act_scale, descending=True)
+    W = W[:, perm]
+    invperm = torch.argsort(perm)
     # get scales, zeros, and g_idx
     maxq = 2 ** bits - 1
     W = W.view(-1, groupsize) #(group_num, group_size)
@@ -20,11 +25,13 @@ def fast_quant(W, bits=4, groupsize=128):
     scales = (xmax - xmin).clamp(min=1e-5) / maxq
     zeros = torch.round(-xmin / scales)
     g_idx = torch.tensor([i // groupsize for i in range(K)], dtype=torch.int32, device=W.device)
+    g_idx = g_idx[invperm]
     # quantize weight
     izeros = zeros.to(torch.int32)
     iweight = torch.clamp(torch.round(W / scales[:, None]) + zeros[:, None], 0, maxq).to(torch.int32)
+    iweight = iweight.view(N, K)[:, invperm]
     # pack iweight
-    iweight = iweight.view(N, K).t().contiguous() #[K, N]
+    iweight = iweight.t().contiguous() #[K, N]
     shifts = torch.arange(0, 32, bits, device=iweight.device)
     iweight = iweight.view(iweight.shape[0] // (32 // bits), 32 // bits, -1)
     qweight = (torch.bitwise_left_shift(iweight, shifts[None, :, None]).sum(dim=1).to(torch.int32))
@@ -35,19 +42,52 @@ def fast_quant(W, bits=4, groupsize=128):
     qzeros = (torch.bitwise_left_shift(izeros, shifts[None, None, :]).sum(dim=-1).to(torch.int32))
     return qweight, scales, qzeros, g_idx
 
-def make_quant(model, bits=4, groupsize=128):
+def make_quant(model, tokenizer, inputs=None, bits=4, groupsize=128):
     """
-    Replace linear layers in a model with qlinear layers. 
-    Except for the lm_head. 
+    Enable act-reorder for RTN quantization. 
     """
+    assert groupsize > 0, "Only group-wise quantization is supported"
+    # register hook function
+    act_scales = {}
+    hooks = []
+
+    def act_hook(m, x, y, name):
+        if isinstance(x, tuple):
+            x = x[0]
+        x = x.view(-1, x.shape[-1])
+        act_scales[name] = torch.norm(x, dim=0) #gptq style
+        #act_scales[name] = torch.max(x.abs(), dim=0)[0] #smoothquant style
+    
     for name, m in model.named_modules():
         if not isinstance(m, nn.Linear):
             continue
         if 'lm_head' in name:
             continue
-        # quantize weight
-        groupsize = m.in_features if groupsize == -1 else groupsize
-        qweight, scales, qzeros, g_idx = fast_quant(m.weight.data, bits, groupsize)
+        hooks.append(
+            m.register_forward_hook(functools.partial(act_hook, name=name))
+        )
+        
+    # get act scales, a.k.a diag(H)
+    stime = time.time()
+    if inputs is None:
+        inputs = "Deep learning is the subset of machine learning methods based on artificial neural networks with representation learning."
+    input_ids = tokenizer(inputs, return_tensors="pt").input_ids
+    model(input_ids.to(model.device))
+    print(f"Time to get act scales: {time.time()-stime:.02f}")
+
+    # remove hook function
+    for h in hooks:
+        h.remove()
+    
+    # quantize with act-reorder
+    stime = time.time()
+    for name, m in model.named_modules():
+        if not isinstance(m, nn.Linear):
+            continue
+        if 'lm_head' in name:
+            continue
+        # quantize
+        qweight, scales, qzeros, g_idx = fast_quant_with_reorder(m.weight.data, act_scales[name], bits, groupsize)
         # replace
         qlayer = QuantLinear(
             bits, groupsize, m.in_features, m.out_features, 
@@ -56,6 +96,7 @@ def make_quant(model, bits=4, groupsize=128):
         parent_name = name.rsplit('.', 1)[0]
         parent = model.get_submodule(parent_name)
         setattr(parent, name[len(parent_name) + 1:], qlayer)
+    print(f"Time to quantize: {time.time()-stime:.02f}")
 
 class QuantLinear(nn.Module):
     def __init__(self, bits, groupsize, infeatures, outfeatures, qweight, scales, qzeros, g_idx, bias):
@@ -213,7 +254,7 @@ def w4a16_matmul(a, qweight, scales, qzeros, g_idx, group_size):
 if __name__ == "__main__":
     """
     We convert fp16 checkpoint to GPTQ-stype qweight and qzeros (w/o -/+1), and then use w4a16 matmul for model inference. 
-    Note: we use a simple round-to-nearest (rtn) method
+    Note: we use the round-to-nearest (rtn) method with act-reorder
     """
     # load
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -222,9 +263,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(model_id)
     print(f"Time to load: {time.time()-stime:.02f}")
-    stime = time.time()
-    make_quant(model)
-    print(f"Time to quantize: {time.time()-stime:.02f}")
+    make_quant(model, tokenizer)
     model.to(device="cuda")
     # test
     print("Testing ...")
