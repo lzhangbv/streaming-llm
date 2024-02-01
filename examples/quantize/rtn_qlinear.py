@@ -46,11 +46,11 @@ def make_quant(model, bits=4, groupsize=128):
         if 'lm_head' in name:
             continue
         # quantize weight
-        groupsize = m.in_features if groupsize == -1 else groupsize
-        qweight, scales, qzeros, g_idx = fast_quant(m.weight.data, bits, groupsize)
+        m_groupsize = m.in_features if groupsize == -1 else groupsize
+        qweight, scales, qzeros, g_idx = fast_quant(m.weight.data, bits, m_groupsize)
         # replace
         qlayer = QuantLinear(
-            bits, groupsize, m.in_features, m.out_features, 
+            bits, m_groupsize, m.in_features, m.out_features, 
             qweight, scales, qzeros, g_idx, m.bias
         )
         parent_name = name.rsplit('.', 1)[0]
