@@ -50,23 +50,6 @@ def make_quant(model, bits=4, groupsize=128):
     print(f"bits={bits}, groupsize={groupsize}") 
     print(f"Mean quantization error: {np.mean(errs):.03f}")
     errs = []
-
-def make_noise(model, ratio=0.1, target=None):
-    """
-    Add some noise to linear layers in a model. 
-    """
-    for name, m in model.named_modules():
-        if not isinstance(m, nn.Linear):
-            continue
-        if 'lm_head' in name:
-            continue
-        
-        if (target is None) or ((target is not None) and (target in name)):
-            print(name)
-            W = m.weight.data
-            noise = torch.rand(W.shape, dtype=W.dtype, device=W.device) - 0.5
-            scale = ratio * torch.norm(W) / torch.norm(noise)
-            W.add_(noise, alpha=scale)   
  
 if __name__ == "__main__":
     """Study the effect of quantization error"""
@@ -78,17 +61,9 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(model_id)
     print(f"Time to load: {time.time()-stime:.02f}")
     stime = time.time()
-    #make_quant(model, 4, -1)
-    #make_quant(model, 4, 128)
-    #make_quant(model, 4, 64)
-    #make_quant(model, 4, 32)
+    make_quant(model, 4, -1)
+    make_quant(model, 4, 128)
+    make_quant(model, 4, 64)
+    make_quant(model, 4, 32)
     print(f"Time to quantize: {time.time()-stime:.02f}")
-
-    # add noise: target is from: q_proj,k_poj,v_proj,o_proj,gate_proj,up_proj,down_proj,attn,mlp,proj
-    make_noise(model, ratio=0.1, target='proj')
-    print("Testing ...")
-    prompt = "What is deep learning?"
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    outputs = model.generate(**inputs, max_new_tokens=25)
-    print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 
