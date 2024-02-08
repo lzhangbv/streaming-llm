@@ -120,8 +120,8 @@ if __name__ == "__main__":
     enable_topk_attention(model, topk=16)
 
     # test
-    text = "What is deep learning?"
-    #text = "What is deep learning, and what is the major difference between deep leanring and machine learning?"
+    #text = "What is deep learning?"
+    text = "What is deep learning, and what is the major difference between deep leanring and machine learning?"
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
     outputs = model.generate(**inputs, max_new_tokens=128)
     print(tokenizer.decode(outputs[0], skip_special_tokens=True))
