@@ -97,6 +97,14 @@ elif args.enable_blockwise_attention:
         enable_llama_blockwise_attention(model)
     else:
         raise ValueError(f"got {model.config.model_type}")
+elif args.enable_pcw_attention:
+    assert not args.enable_start_recent_kv_cache
+    if "llama" in model.config.model_type:
+        from streaming_llm.pos_shift.modify_llama import enable_llama_pcw_attention
+
+        enable_llama_pcw_attention(model)
+    else:
+        raise ValueError(f"got {model.config.model_type}")
 elif args.enable_kmeans_attention:
     assert not args.enable_start_recent_kv_cache
     if "llama" in model.config.model_type: 
@@ -319,7 +327,7 @@ elif args.task == "passkey":
         accuracy = num_correct / num_iter
         print(f"************ Finish testing passkey retrieval per prompt with average prompt length {avg_length}, accuracy: {accuracy} ************")
 elif args.task == "qa":
-    total_num_docs = [10] #[10, 20, 30]
+    total_num_docs = [20] #[10, 20, 30]
     for num_docs in total_num_docs: 
         print(f"************ Start testing {num_docs} documents QA ***********")
         num_correct = 0
