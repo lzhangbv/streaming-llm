@@ -137,6 +137,10 @@ def greedy_generate(model, tokenizer, prompt, max_gen_len, kv_cache_evict=None):
         chunk_size = args.chunk_size
         iter_num = (prompt_length+chunk_size-1) // chunk_size
         input_chunks = [input_ids[:,i * chunk_size: (i+1) * chunk_size] for i in range(iter_num)]
+    elif args.enable_blockwise_attention or args.enable_pcw_attention:
+        question_len = 64 # no blockwise for the question
+        assert prompt_length > question_len 
+        input_chunks = [input_ids[:, :-question_len], input_ids[:, -question_len:]]
     else:
         input_chunks = [input_ids]
     
