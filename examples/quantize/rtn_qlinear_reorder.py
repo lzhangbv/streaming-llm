@@ -80,6 +80,7 @@ def make_quant(model, tokenizer, inputs=None, bits=4, groupsize=128):
         h.remove()
     
     # quantize with act-reorder
+    model.to(torch.float16)
     stime = time.time()
     for name, m in model.named_modules():
         if not isinstance(m, nn.Linear):

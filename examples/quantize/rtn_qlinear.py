@@ -40,6 +40,7 @@ def make_quant(model, bits=4, groupsize=128):
     Replace linear layers in a model with qlinear layers. 
     Except for the lm_head. 
     """
+    model.to(torch.float16)
     for name, m in model.named_modules():
         if not isinstance(m, nn.Linear):
             continue

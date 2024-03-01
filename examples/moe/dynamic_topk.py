@@ -75,9 +75,14 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(model_id)
     model.eval()
 
+    # set pad token id
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    model.generation_config.pad_token_id = tokenizer.pad_token_id
+
     enable_dynamic_topk(model, threshold=0.3)
     
     text = "Given that f(x) = 4x^3 - 9x - 14, find the value of f(2)."
-    inputs = tokenizer(text, return_tensors="pt")
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
     outputs = model.generate(**inputs, max_new_tokens=1024)
     print(tokenizer.decode(outputs[0], skip_special_tokens=True))
