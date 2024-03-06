@@ -56,6 +56,7 @@ parser.add_argument('--local_rank', type=int, default=0,
 parser.add_argument('--dtype', default="fp32", type=str, choices=["bf16", "fp16", "fp32"])
 parser.add_argument("--cpu_offload", action="store_true")
 parser.add_argument("--gradient_checkpoint", action="store_true")
+parser.add_argument("--fused_adam", action="store_true")
 
 
 args = parser.parse_args()
@@ -99,7 +100,7 @@ model = FSDP(
     device_id=torch.cuda.current_device(),
 )
 
-optimizer = optim.AdamW(model.parameters(), lr=0.0001)
+optimizer = optim.AdamW(model.parameters(), lr=0.0001, fused=args.fused_adam)
 
 # Set up fixed fake data
 data = torch.randint(low=0, high=1000, size=(args.batch_size, args.seq_len + 1))
