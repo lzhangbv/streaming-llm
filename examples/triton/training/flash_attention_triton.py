@@ -1,19 +1,5 @@
 """
-*Experimental* implementation of FlashAttention in Triton.
-
-We use the FlashAttention implementation from Phil Tillet a starting point.
-https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py
-
-Changes:
-- Implement both causal and non-causal attention.
-- Implement both self-attention and cross-attention.
-- Support arbitrary seqlens (not just multiples of 128), for both forward and backward.
-- Support all head dimensions up to 128 (not just 16, 32, 64, 128), for both forward and backward.
-- Support attention bias.
-- Speed up the forward pass a bit, and only store the LSE instead of m and l.
-- Make the backward for d=128 much faster by reducing register spilling.
-- Optionally parallelize the backward pass across seqlen_k, to deal with the case of
-small batch size * nheads.
+* Tri Dao's FlashAttention in Triton.
 
 Caution:
 - This is an *experimental* implementation. The forward pass should be quite robust but
@@ -1038,8 +1024,8 @@ if __name__ == "__main__":
     device = 'cuda'
 
     batch_size = 1
-    seqlen = 128
-    nheads = 1
+    seqlen = 1024
+    nheads = 32
     d = 128
 
     # inputs

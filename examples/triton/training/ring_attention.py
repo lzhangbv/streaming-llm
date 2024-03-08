@@ -1,6 +1,6 @@
 """
 Ring Attention for Sequence Parallel Causal LLM Training. 
-    - Flash Attention is adopted from Tri Dao's Triton Implementation
+    - Flash Attention is adopted from Tri Dao's Implementation
     - Ring Attention is adopted from Zhu Zilin's ZigZag Implementation
 
     Example: CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 ring_attention.py
@@ -10,7 +10,17 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from flash_attention import _flash_attn_forward, _flash_attn_backward, flash_attn_func
+
+try:
+    from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
+    from flash_attn import flash_attn_func
+    is_flash = True
+except:
+    # Use Triton implementation if FlashAttention is not installed
+    # Warning: the triton version could cause some numerical differences
+    from flash_attention_triton import _flash_attn_forward, _flash_attn_backward, flash_attn_func
+    is_flash = False
+
 
 ##### utilization #####
 def extract_local(value, rank, world_size, dim=1):
@@ -126,15 +136,27 @@ def ring_flash_attn_forward(
     next_k, next_v = None, None
 
     def forward(q, k, v, causal):
-        # blockwise attention
-        block_out, block_lse, _ = _flash_attn_forward(
-            q,
-            k,
-            v,
-            bias=None,
-            causal=causal,
-            softmax_scale=softmax_scale,
-        )
+        if is_flash:
+            block_out, _, _, _, _, block_lse, _, _ = _flash_attn_forward(
+                q, 
+                k, 
+                v, 
+                dropout_p=0,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                return_softmax=False,
+            )
+        else:
+            block_out, block_lse, _ = _flash_attn_forward(
+                q,
+                k,
+                v,
+                causal=causal,
+                softmax_scale=softmax_scale,
+                bias=None,
+            )
         return block_out, block_lse
 
     for step in range(comm.world_size):
@@ -206,20 +228,40 @@ def ring_flash_attn_backward(
     def backward(dout, q, k, v, out, softmax_lse, causal):
         seqlen_q = q.shape[1]
         seqlen_kv = k.shape[1]
-        _flash_attn_backward(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq_buffer[:, :seqlen_q],
-            dk_buffer[:, :seqlen_kv],
-            dv_buffer[:, :seqlen_kv],
-            bias=None,
-            causal=causal,
-            softmax_scale=softmax_scale,
-        )
+        if is_flash:
+            _flash_attn_backward(
+                dout,
+                q, 
+                k, 
+                v, 
+                out,
+                softmax_lse,
+                dq_buffer[:, :seqlen_q],
+                dk_buffer[:, :seqlen_kv],
+                dv_buffer[:, :seqlen_kv],
+                dropout_p=0,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                deterministic=False,
+                rng_state=None,
+            )
+        else:
+            _flash_attn_backward(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dq_buffer[:, :seqlen_q],
+                dk_buffer[:, :seqlen_kv],
+                dv_buffer[:, :seqlen_kv],
+                causal=causal,
+                softmax_scale=softmax_scale,
+                bias=None,
+            )
 
     for step in range(kv_comm.world_size):
         if step + 1 != kv_comm.world_size:
@@ -341,7 +383,7 @@ def _log(msg, a, rank0_only=False):
         if rank == 0:
             print(
                 f"{msg}: "
-                #f"max {a.abs().max().item()}, "
+                f"max {a.abs().max().item()}, "
                 f"mean {a.abs().mean().item()}",
                 flush=True,
             )
@@ -353,7 +395,7 @@ def _log(msg, a, rank0_only=False):
                 print(f"{msg}:")
             print(
                 f"[{rank}] "
-                #f"max {a.abs().max().item()}, "
+                f"max {a.abs().max().item()}, "
                 f"mean {a.abs().mean().item()}",
                 flush=True,
             )
@@ -407,4 +449,3 @@ if __name__ == "__main__":
     _log("dq diff", local_dqkv[:, :, 0, :] - local_dqkv_ref[:, :, 0, :])
     _log("dk diff", local_dqkv[:, :, 1, :] - local_dqkv_ref[:, :, 1, :])
     _log("dv diff", local_dqkv[:, :, 2, :] - local_dqkv_ref[:, :, 2, :])
-    
