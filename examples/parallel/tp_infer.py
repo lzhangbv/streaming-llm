@@ -1,3 +1,7 @@
+"""
+Tensor Parallelism for LLM Inference. 
+"""
+
 import os
 
 import torch
@@ -96,7 +100,7 @@ def apply_tp(model):
 if __name__ == "__main__":
     """
     Run tp using the following command:
-        CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 tensor_parallel.py
+        CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 tp_infer.py
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
     # init
