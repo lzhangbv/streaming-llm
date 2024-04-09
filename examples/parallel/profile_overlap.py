@@ -1,4 +1,5 @@
 import os
+import collections
 
 import torch
 import torch.distributed as dist
@@ -39,28 +40,75 @@ def overlap_comm_and_comp(x, weights, comm_stream):
     torch.cuda.synchronize()
 
 
+class EventQueue:
+    def __init__(self, limit_num=2):
+        self.queue = collections.deque()
+        self.limit_num = limit_num
+    
+    def enqueue(self, event):
+        self.queue.append(event)
+    
+    def dequent(self):
+        if len(self.queue) >= self.limit_num:
+            return self.queue.popleft()
+        return None
+
+    def clear(self):
+        self.queue.clear()
+
+
+def limit_overlap_comm_and_comp(x, weights, comm_stream, event_queue):
+    """
+    Limit the maximum number of communication operations, e.g., no overlap if limit_num=1
+    """
+    for i in range(len(weights)):
+        event = event_queue.dequent()
+        if event is not None:
+            # option 1: cpu waits event
+            #event.synchronize()
+
+            # option 2: comm_stream waits event (suggest)
+            comm_stream.wait_event(event)
+        
+        with torch.cuda.stream(comm_stream):
+            dist.all_reduce(weights[i])
+
+        torch.cuda.current_stream().wait_stream(comm_stream)
+        x = torch.matmul(x, weights[i])
+        
+        new_event = torch.cuda.Event()
+        new_event.record()
+        event_queue.enqueue(new_event)
+
+    event_queue.clear()
+    torch.cuda.synchronize()
+
+
 if __name__ == "__main__":
     rank, world_size = init_dist()
     assert world_size > 1
 
-    N = 8
-    batch = 4096 # it controls the computation-to-communication ratio
+    N = 16
+    batch = 4096 * 2 # it controls the computation-to-communication ratio
     dim = 8192
 
     x = torch.randn((batch, dim), dtype=torch.float, device='cuda')
     weights = [torch.randn((dim, dim), dtype=torch.float, device='cuda') for _ in range(N)]
     comm_stream = torch.cuda.Stream()
+    event_queue = EventQueue(limit_num=3)
 
     # warmup
     naive_comp_and_comm(x, weights)
     overlap_comp_and_comm(x, weights, comm_stream)
     overlap_comm_and_comp(x, weights, comm_stream)
+    limit_overlap_comm_and_comp(x, weights, comm_stream, event_queue)
     
     # profile
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
         naive_comp_and_comm(x, weights)
         overlap_comp_and_comm(x, weights, comm_stream)
         overlap_comm_and_comp(x, weights, comm_stream)
+        limit_overlap_comm_and_comp(x, weights, comm_stream, event_queue)
 
     prof.export_chrome_trace("trace.json")
 
