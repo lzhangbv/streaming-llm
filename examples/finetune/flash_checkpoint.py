@@ -11,6 +11,8 @@ from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
 
 
+ACTIVATION_OFFLOAD = False
+
 class FlashCheckpointFunction(torch.autograd.Function):
     """Two functions f1 and f2 are built, i.e., 
     1) qkv = f1(hidden_states, position_ids)
@@ -42,14 +44,26 @@ class FlashCheckpointFunction(torch.autograd.Function):
         ctx.run_function2 = run_function2
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+
+        if ACTIVATION_OFFLOAD:
+            ctx.saved_device = hidden_states.device
+            saved_hidden_states = hidden_states.to("cpu", non_blocking=True)
+            saved_attn_out = attn_out.to("cpu", non_blocking=True)
+        else:
+            saved_hidden_states = hidden_states
+            saved_attn_out = attn_out
         
-        ctx.save_for_backward(hidden_states, position_ids, attn_out, softmax_lse)
+        ctx.save_for_backward(saved_hidden_states, position_ids, saved_attn_out, softmax_lse)
         
         return output
     
     @staticmethod
     def backward(ctx, dout):
         hidden_states, position_ids, attn_out, softmax_lse = ctx.saved_tensors
+
+        if ACTIVATION_OFFLOAD:
+            hidden_states = hidden_states.to(ctx.saved_device, non_blocking=True)
+            attn_out = attn_out.to(ctx.saved_device, non_blocking=True)
 
         # detach hidden states
         hidden_states = hidden_states.detach().requires_grad_()
