@@ -1,6 +1,8 @@
 import torch
 from torch.profiler import profile, ProfilerActivity
 
+import threading
+
 
 def non_blocking_io_and_comp(x, weights_cpu, non_blocking=True):
     for i in range(len(weights_cpu)):
@@ -52,6 +54,32 @@ def overlap_intra_gpu_comm_and_comp(x, remote_weights, send_stream, recv_stream)
     torch.cuda.synchronize()
 
 
+def overlap_comp_and_save(x, weights_gpu, transfer_stream):
+    """
+    Async Tensor Save: transfer from gpu to cpu in a new cuda stream, and save tensor in a new cpu thread (i.e., async checkpoint)
+    """
+    def save_data_thread(weight, transfer_stream):
+        # cpu waits data transfer
+        transfer_stream.synchronize()
+        # cpu saves tensor
+        torch.save(weight, 'weight.pt')
+        
+    for i in range(len(weights_gpu)):
+        torch.matmul(x, weights_gpu[i])
+        if i == 0:
+            # d2h data transfer
+            transfer_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(transfer_stream):
+                weight = weights_gpu[i].to('cpu', non_blocking=True)
+            # save tensor
+            save_thread = threading.Thread(target=save_data_thread, args=(weight, transfer_stream))
+            save_thread.start()
+        elif i == 1:
+            # overlap data trasfer only with the next iteration
+            torch.cuda.current_stream().wait_stream(transfer_stream)
+    torch.cuda.synchronize()
+
+
 if __name__ == "__main__":
     N = 8
     batch = 4096  # it controls the computation-to-io ratio
@@ -65,6 +93,7 @@ if __name__ == "__main__":
     
     # gpu-to-cpu
     weights_gpu = [torch.randn((dim, dim), dtype=torch.float, device='cuda') for _ in range(N)]
+    weights_gpu[0].fill_(1.0)
     transfer_stream = torch.cuda.Stream()
 
     # gpu-to-gpu
@@ -82,6 +111,7 @@ if __name__ == "__main__":
     #non_blocking_comp_and_io(x, weights_gpu, non_blocking=True)
     #overlap_comp_and_io(x, weights_gpu, non_blocking=True, transfer_stream=transfer_stream)
     overlap_intra_gpu_comm_and_comp(x, remote_weights, send_stream, recv_stream)
+    overlap_comp_and_save(x, weights_gpu, transfer_stream)
 
     # profile
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
@@ -92,5 +122,6 @@ if __name__ == "__main__":
         #non_blocking_comp_and_io(x, weights_gpu, non_blocking=True)
         #overlap_comp_and_io(x, weights_gpu, non_blocking=True, transfer_stream=transfer_stream)
         overlap_intra_gpu_comm_and_comp(x, remote_weights, send_stream, recv_stream)
+        overlap_comp_and_save(x, weights_gpu, transfer_stream)
     
     prof.export_chrome_trace("trace.json")
