@@ -44,7 +44,7 @@ def overlap_comp_and_comm_with_async_op(x, weights):
 
 def overlap_comm_and_comp(x, weights, comm_stream):
     assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != '1'
-    # if we execute comm and comp sequentially, comp_i has to waits comm_i and it may blocks comm_i+1 (i.e., no overlap)
+    # if we execute comm and comp sequentially, comp_i has to waits comm_i and it may block comm_i+1 (i.e., no overlap)
     for i in range(len(weights)):
         with torch.cuda.stream(comm_stream):
             dist.all_reduce(weights[i])
@@ -55,7 +55,7 @@ def overlap_comm_and_comp(x, weights, comm_stream):
 
 def overlap_comm_and_comp_with_async_op(x, weights):
     assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != '1'
-    # if we execute comm tasks before comm tasks, the first comm has to wait until last comm starts
+    # if we execute comm tasks before comp tasks, the first comp has to wait until last comm starts
     handles = []
     for i in range(len(weights)):
         handles.append(dist.all_reduce(weights[i], async_op=True))
@@ -243,5 +243,6 @@ if __name__ == "__main__":
         #overlap_two_comms(weights, weights2, comm_stream, comm_stream2)
         #overlap_two_comps(x, weights, weights2, comm_stream, comm_stream2)
 
-    prof.export_chrome_trace("trace.json")
+    if rank == 0:
+        prof.export_chrome_trace("trace.json")
 
