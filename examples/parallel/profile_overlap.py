@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 from torch.profiler import profile, ProfilerActivity
 
+#os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
 
 def init_dist():
     rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -42,6 +43,8 @@ def overlap_comp_and_comm_with_async_op(x, weights):
 
 
 def overlap_comm_and_comp(x, weights, comm_stream):
+    assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != '1'
+    # if we execute comm and comp sequentially, comp_i has to waits comm_i and it may blocks comm_i+1 (i.e., no overlap)
     for i in range(len(weights)):
         with torch.cuda.stream(comm_stream):
             dist.all_reduce(weights[i])
@@ -51,12 +54,33 @@ def overlap_comm_and_comp(x, weights, comm_stream):
 
 
 def overlap_comm_and_comp_with_async_op(x, weights):
+    assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != '1'
+    # if we execute comm tasks before comm tasks, the first comm has to wait until last comm starts
     handles = []
     for i in range(len(weights)):
         handles.append(dist.all_reduce(weights[i], async_op=True))
     for i in range(len(weights)):
         handles[i].wait()
         x = torch.matmul(x, weights[i])
+    torch.cuda.synchronize()
+
+
+def bulk_overlap_comm_and_comp(x, weights):
+    """overlap comm and comp tasks that have no dependencies with each other. """
+    # 
+    # Runing matmul can comsume all SMs and block executing async allreduce
+    # option 1: we can set CUDA_DEVICE_MAX_CONNECTIONS=1 to gurantee execition with launch order
+    # however, it will make overlap_comm_and_comp and overlap_comm_and_comp_with_async_op fail to overlap
+    #
+    handles = []
+    for i in range(len(weights)):
+        handles.append(dist.all_reduce(weights[i], async_op=True))
+        # option 2: execute a small compute kernel (e.g., add_one) here can avoid the blocking problem
+        #x.add(1)
+        torch.matmul(x, x.T)
+    for handle in handles:
+        handle.wait()
+    torch.cuda.synchronize()
 
 
 def overlap_two_comms(weights1, weights2, stream1, stream2):
@@ -201,6 +225,7 @@ if __name__ == "__main__":
     overlap_comp_and_comm_with_async_op(x, weights)
     #overlap_comm_and_comp(x, weights, comm_stream)
     #overlap_comm_and_comp_with_async_op(x, weights)
+    bulk_overlap_comm_and_comp(x, weights)
     #limit_overlap_comm_and_comp(x, weights, comm_stream, event_queue)
     #overlap_two_comms(weights, weights2, comm_stream, comm_stream2)
     #overlap_two_comps(x, weights, weights2, comm_stream, comm_stream2)
@@ -213,6 +238,7 @@ if __name__ == "__main__":
         overlap_comp_and_comm_with_async_op(x, weights)
         #overlap_comm_and_comp(x, weights, comm_stream)
         #overlap_comm_and_comp_with_async_op(x, weights)
+        bulk_overlap_comm_and_comp(x, weights)
         #limit_overlap_comm_and_comp(x, weights, comm_stream, event_queue)
         #overlap_two_comms(weights, weights2, comm_stream, comm_stream2)
         #overlap_two_comps(x, weights, weights2, comm_stream, comm_stream2)
