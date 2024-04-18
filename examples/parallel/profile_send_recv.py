@@ -13,9 +13,12 @@ def init_dist():
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     return rank, world_size
 
+
+"""Basic P2P Operations"""
+
 def profile_send_recv(weights, rank, world_size):
     """
-    Send and recv use two cuda streams, and they are different from nccl stream, which is used for collective communications
+    Send/recv with different ranks use two cuda streams, and they are different from nccl collective communication stream
     """
     recv_prev, send_next, recv_next, send_prev = weights[0], weights[1], weights[2], weights[3]
     next_rank = (rank + 1) % world_size
@@ -47,7 +50,7 @@ def profile_send_recv(weights, rank, world_size):
 
 def profile_isend_irecv(weights, rank, world_size):
     """
-    isend and irecv are not blocking with each other, as they are using different cuda streams
+    isend and irecv with different ranks are not blocking with each other, as they are using different cuda streams
     """
     recv_prev, send_next, recv_next, send_prev = weights[0], weights[1], weights[2], weights[3]
     next_rank = (rank + 1) % world_size
@@ -76,7 +79,7 @@ def profile_isend_irecv(weights, rank, world_size):
 
 def profile_batch_isend_irecv(weights, rank, world_size):
     """
-    Batch async p2p ops: operations within a group will be a single kernel, and sent to nccl stream
+    Batch async p2p ops: operations within a group will be a single kernel (no deadlock), and sent to nccl stream
     """
     recv_prev, send_next, recv_next, send_prev = weights[0], weights[1], weights[2], weights[3]
     next_rank = (rank + 1) % world_size
@@ -95,6 +98,66 @@ def profile_batch_isend_irecv(weights, rank, world_size):
 
     torch.cuda.synchronize()
 
+
+"""Gather, Scatter, Interleave Send and Recv"""
+
+def profile_gather_with_p2p(weights, rank, world_size):
+    """
+    Rank 0 receives weights from other ranks, and it will use world_size - 1 cuda streams for recv operations.  
+    """
+    assert len(weights) >= world_size
+    if rank == 0:
+        handles = []
+        for i in range(1, world_size):
+            handles.append(dist.irecv(weights[i], src=i))
+        for handle in handles:
+            handle.wait()
+    else:
+        handle = dist.isend(weights[rank], dst=0)
+        handle.wait()
+    torch.cuda.synchronize()
+
+
+def profile_scatter_with_p2p(weights, rank, world_size):
+    """
+    Rank 0 sends weights to other rankns, and it will use world_size - 1 cuda streams for send operations.
+    """
+    assert len(weights) >= world_size
+    if rank == 0:
+        handles = []
+        for i in range(1, world_size):
+            handles.append(dist.isend(weights[i], dst=i))
+        for handle in handles:
+            handle.wait()
+    else:
+        handle = dist.irecv(weights[rank], src=0)
+        handle.wait()
+    torch.cuda.synchronize()
+
+
+def profile_interleaved_send_recv(weights, rank, world_size):
+    """
+    Rank 2i alternatively sends and recvs weights to/from rank 2i+1. There is no overlap because send and recv use one cuda stream. 
+    """
+    assert world_size % 2 == 0
+    handles = []
+    for i in range(len(weights)):
+        if rank % 2 == 0:
+            if i % 2 == 0:
+                handles.append(dist.isend(weights[i], dst=rank+1))
+            else:
+                handles.append(dist.irecv(weights[i], src=rank+1))
+        else:
+            if i % 2 == 0:
+                handles.append(dist.irecv(weights[i], src=rank-1))
+            else:
+                handles.append(dist.isend(weights[i], dst=rank-1))
+    for handle in handles:
+        handle.wait()
+    torch.cuda.synchronize()
+
+
+"""GPipe"""
 
 def profile_gpipe_send_recv(x, recv_weights, send_weights, rank, world_size):
     """GPipe: no overlap between comm and comp"""
@@ -169,6 +232,36 @@ def profile_gpipe_isend_irecv(x, recv_weights, send_weights, recv_stream, send_s
     torch.cuda.synchronize()
 
 
+def profile_gpipe_isend_irecv_with_asyn_ops(x, recv_weights, send_weights, rank, world_size):
+    """When all irecv operations are issued in advance, they may be interfered by later matmul operations."""
+    # forward
+    handles = []
+    for i in range(len(recv_weights)):
+        if rank > 0:
+            handles.append(dist.irecv(recv_weights[i], src=rank-1))
+    for i in range(len(recv_weights)):
+        if rank > 0:
+            handles[i].wait()
+        torch.matmul(x, x.T)
+        if rank < world_size - 1: 
+            dist.isend(send_weights[i], dst=rank+1)
+
+    # backward
+    handles = []
+    for i in range(len(recv_weights)):
+        if rank < world_size - 1:
+            handles.append(dist.irecv(recv_weights[i], src=rank+1))
+    for i in range(len(recv_weights)):
+        if rank < world_size - 1:
+            handles[i].wait()
+        torch.matmul(x, x.T)
+        torch.matmul(x, x.T)
+        if rank > 0:
+            dist.isend(send_weights[i], dst=rank-1)
+    torch.cuda.synchronize()
+
+
+
 if __name__ == "__main__":
     rank, world_size = init_dist()
     assert world_size > 1
@@ -190,20 +283,42 @@ if __name__ == "__main__":
     #profile_send_recv(weights, rank, world_size)
     #profile_isend_irecv(weights, rank, world_size)
     #profile_batch_isend_irecv(weights, rank, world_size)
+    #profile_gather_with_p2p(weights, rank, world_size)
+    #profile_scatter_with_p2p(weights, rank, world_size)
+    #profile_interleaved_send_recv(weights, rank, world_size)
     profile_gpipe_send_recv(x, recv_weights, send_weights, rank, world_size)
-    profile_gpipe_isend_recv(x, recv_weights, send_weights, rank, world_size)
+    #profile_gpipe_isend_recv(x, recv_weights, send_weights, rank, world_size)
     profile_gpipe_isend_irecv(x, recv_weights, send_weights, recv_stream, send_stream, rank, world_size)
+    #profile_gpipe_isend_irecv_with_asyn_ops(x, recv_weights, send_weights, rank, world_size)
 
+    nsys = False # use nsight system or torch profiler
     # profile
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-        #profile_send_recv(weights, rank, world_size)
-        #profile_isend_irecv(weights, rank, world_size)
-        #profile_batch_isend_irecv(weights, rank, world_size)
+    if not nsys:
+        """use torch profiler"""
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+            #profile_send_recv(weights, rank, world_size)
+            #profile_isend_irecv(weights, rank, world_size)
+            #profile_batch_isend_irecv(weights, rank, world_size)
+            #profile_gather_with_p2p(weights, rank, world_size)
+            #profile_scatter_with_p2p(weights, rank, world_size)
+            #profile_interleaved_send_recv(weights, rank, world_size)
+            profile_gpipe_send_recv(x, recv_weights, send_weights, rank, world_size)
+            #profile_gpipe_isend_recv(x, recv_weights, send_weights, rank, world_size)
+            profile_gpipe_isend_irecv(x, recv_weights, send_weights, recv_stream, send_stream, rank, world_size)
+            #profile_gpipe_isend_irecv_with_asyn_ops(x, recv_weights, send_weights, rank, world_size)
+
+        if rank == 0:
+            prof.export_chrome_trace("p2p.json")
+        #prof.export_chrome_trace(f"p2p_{rank}.json")
+
+    else:
+        """using nsight system"""
+        # nsys profile --capture-range=cudaProfilerApi --stop-on-range-end=true torchrun --nproc-per-node=4 profile_send_recv.py
+        torch.cuda.cudart().cudaProfilerStart()
+        
         profile_gpipe_send_recv(x, recv_weights, send_weights, rank, world_size)
-        profile_gpipe_isend_recv(x, recv_weights, send_weights, rank, world_size)
         profile_gpipe_isend_irecv(x, recv_weights, send_weights, recv_stream, send_stream, rank, world_size)
 
-    if rank == 0:
-        prof.export_chrome_trace("p2p.json")
-    #prof.export_chrome_trace(f"p2p_{rank}.json")
+        torch.cuda.cudart().cudaProfilerStop()
         
+
