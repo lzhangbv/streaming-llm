@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy, lambda_auto_wrap_policy, _or_policy
 from torch.profiler import profile, ProfilerActivity
 
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -20,7 +20,7 @@ FSDP for Base Model, and DDP for LoRA Adaptors.
 """
 
 class LinearLoRA(nn.Module):
-    def __init__(self, linear, r, alpha):
+    def __init__(self, linear, r, alpha, sync_lora=True):
         super().__init__()
 
         self.base = linear
@@ -35,11 +35,52 @@ class LinearLoRA(nn.Module):
         self.w_b = nn.Linear(r, self.out_features, bias=False, device=device, dtype=dtype)
 
         # sync params among ddp workers
-        dist.broadcast(self.w_a.weight.data, src=0)
+        if sync_lora:
+            dist.broadcast(self.w_a.weight.data, src=0)
         self.w_b.weight.data.fill_(0.)
     
     def forward(self, hidden_states):
         return self.base(hidden_states) + self.alpha * self.w_b(self.w_a(hidden_states))
+
+
+def naive_fsdp_lora(model, r=32, alpha=1):
+    # freeze model
+    for name, p in model.named_parameters():
+        p.requires_grad = False
+
+    # add lora adaptor
+    for name, m in model.named_modules():
+        if not isinstance(m, nn.Linear):
+            continue
+        if 'lm_head' in name:
+            continue
+
+        linear_lora = LinearLoRA(m, r, alpha, sync_lora=False)
+        parent_name = name.rsplit('.', 1)[0]
+        parent = model.get_submodule(parent_name)
+        setattr(parent, name[len(parent_name) + 1:], linear_lora)
+    
+    # wrap fsdp
+    def lambda_policy_fn(module):
+        if (
+            len(list(module.named_children())) == 0
+            and getattr(module, "weight", None) is not None
+            and module.weight.requires_grad
+        ):
+            return True
+        return False
+
+    lambda_policy = partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
+    transformer_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={LlamaDecoderLayer})
+    auto_wrap_policy = partial(_or_policy, policies=[lambda_policy, transformer_wrap_policy])
+
+    model = FSDP(
+        model, 
+        auto_wrap_policy=auto_wrap_policy, 
+        device_id=torch.cuda.current_device(),
+    )
+
+    return model
 
 
 def fsdp_lora(model, r=32, alpha=1):
@@ -98,6 +139,10 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_config(config)
 
     # wrap fsdp and lora
+    # 1) naive wrap
+    #model = naive_fsdp_lora(model, r=32, alpha=1)
+
+    # 2) optimized wrap
     model = fsdp_lora(model, r=32, alpha=1)
 
     optimizer = optim.AdamW(
