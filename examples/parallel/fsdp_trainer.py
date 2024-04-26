@@ -14,6 +14,7 @@ import os
 import time
 from functools import partial
 
+import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import (
     CPUOffload,
@@ -22,6 +23,12 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy
 )
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+    CheckpointImpl,
+    apply_activation_checkpointing,
+)
+from torch.profiler import profile, ProfilerActivity
 
 from transformers import AutoModelForCausalLM, AutoConfig
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
@@ -47,6 +54,7 @@ parser.add_argument('--num-iters', type=int, default=5,
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='disables CUDA training')
 parser.add_argument("--memory_snapshot", action="store_true")
+parser.add_argument("--profile", action="store_true")
 
 parser.add_argument('--local_rank', type=int, default=0,
                     help='local rank for distributed training')
@@ -55,7 +63,8 @@ parser.add_argument('--local_rank', type=int, default=0,
 # fsdp parameters
 parser.add_argument('--dtype', default="fp32", type=str, choices=["bf16", "fp16", "fp32"])
 parser.add_argument("--cpu_offload", action="store_true")
-parser.add_argument("--gradient_checkpoint", action="store_true")
+parser.add_argument("--hf_gradient_checkpoint", action="store_true")
+parser.add_argument("--fsdp_gradient_checkpoint", action="store_true")
 parser.add_argument("--fused_adam", action="store_true")
 
 
@@ -71,9 +80,17 @@ if args.cuda:
 
 # Set up standard model.
 config = AutoConfig.from_pretrained(args.model_id)
+config.use_cache = False
+
+# artifact config
+#config.num_hidden_layers = 8
+#config.vocab_size = 1024
+#config.hidden_size = 1024
+
 model = AutoModelForCausalLM.from_config(config)
 
-if args.gradient_checkpoint:
+if args.hf_gradient_checkpoint and (not args.fsdp_gradient_checkpoint):
+    # two all-gather ops for both recomputation and backward
     model.gradient_checkpointing_enable()
 
 llama_auto_wrap_policy = partial(
@@ -99,6 +116,16 @@ model = FSDP(
     mixed_precision=mp_policy,
     device_id=torch.cuda.current_device(),
 )
+
+if args.fsdp_gradient_checkpoint:
+    # one all-gather op for recomputation and backward
+    # to check: it seems to have more memory overhead than hf_gradient_checkpoint
+    non_reentrant_wrapper = partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+    check_fn = lambda submodule: isinstance(submodule, LlamaDecoderLayer)
+    apply_activation_checkpointing(model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn)
+
+#if dist.get_rank() == 0:
+#    print(model)
 
 optimizer = optim.AdamW(model.parameters(), lr=0.0001, fused=args.fused_adam)
 
@@ -153,6 +180,12 @@ img_sec_conf = 1.96 * np.std(img_secs)
 log('Img/sec per %s: %.1f +-%.1f' % (device, img_sec_mean, img_sec_conf))
 log('Total img/sec on %d %s(s): %.1f +-%.1f' %
     (dist.get_world_size(), device, dist.get_world_size() * img_sec_mean, dist.get_world_size() * img_sec_conf))
+log('Memory used: %.02f GB' % (torch.cuda.max_memory_reserved() / 1e9))
 
+if args.profile:
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        timeit.timeit(benchmark_step, number=1)
+    if dist.get_rank() == 0:
+        prof.export_chrome_trace("fsdp_benchmark.json")
 
 

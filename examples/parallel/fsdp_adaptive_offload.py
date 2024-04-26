@@ -10,6 +10,7 @@ import torch.distributed as dist
 from torch.distributed.fsdp.api import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.profiler import profile, ProfilerActivity
 
 
 def _custom_construct_wrap_fn(
@@ -117,9 +118,14 @@ if __name__ == "__main__":
     # warmup
     one_step()
 
+    # profile
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        one_step()
+
     if dist.get_rank() == 0:
         n_offload = (config.num_hidden_layers + offload_freq - 1) // offload_freq if offload_freq > 0 else 0
         #print(model)
         print(f"{n_offload} out of {config.num_hidden_layers} transformer layers are offloaded.")
         print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
+        prof.export_chrome_trace("fsdp_offload.json")
 
