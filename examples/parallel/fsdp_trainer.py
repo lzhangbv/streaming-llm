@@ -109,6 +109,22 @@ else:
 if args.memory_snapshot and dist.get_rank() == 0:
     torch.cuda.memory._record_memory_history(max_entries=100000)
 
+# fsdp checkpoint configs
+# if checkpoint_is_fsdp or non_reentrant, one all-gather op for recomputation and backward; 
+# otherwise, two all-gather ops for recomputation and backward like hf_gradient_checkpoint. 
+checkpoint_in_fsdp = True
+non_reentrant = True
+
+if non_reentrant:
+    checkpoint_wrapper_fn = partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+else:
+    checkpoint_wrapper_fn = partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.REENTRANT)
+check_fn = lambda submodule: isinstance(submodule, LlamaDecoderLayer)
+
+if args.fsdp_gradient_checkpoint and not checkpoint_in_fsdp: 
+    """checkpoint(fsdp(module))"""
+    apply_activation_checkpointing(model, checkpoint_wrapper_fn=checkpoint_wrapper_fn, check_fn=check_fn)
+
 model = FSDP(
     model, 
     auto_wrap_policy=llama_auto_wrap_policy,
@@ -117,12 +133,9 @@ model = FSDP(
     device_id=torch.cuda.current_device(),
 )
 
-if args.fsdp_gradient_checkpoint:
-    # one all-gather op for recomputation and backward
-    # to check: it seems to have more memory overhead than hf_gradient_checkpoint
-    non_reentrant_wrapper = partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
-    check_fn = lambda submodule: isinstance(submodule, LlamaDecoderLayer)
-    apply_activation_checkpointing(model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn)
+if args.fsdp_gradient_checkpoint and checkpoint_in_fsdp:
+    """fsdp(checkpoint(module))"""
+    apply_activation_checkpointing(model, checkpoint_wrapper_fn=checkpoint_wrapper_fn, check_fn=check_fn)
 
 #if dist.get_rank() == 0:
 #    print(model)
@@ -156,10 +169,11 @@ device = 'GPU' if args.cuda else 'CPU'
 log('Number of %ss: %d' % (device, dist.get_world_size()))
 
 # Memory Snapshot
-if args.memory_snapshot and dist.get_rank() == 0:
+if args.memory_snapshot:
     timeit.timeit(benchmark_step, number=3)
-    torch.cuda.memory._dump_snapshot("fsdp_snapshot.pickle")
-    torch.cuda.memory._record_memory_history(enabled=None)
+    if dist.get_rank() == 0: 
+        torch.cuda.memory._dump_snapshot("fsdp_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 # Warm-up
 log('Running warmup...')
