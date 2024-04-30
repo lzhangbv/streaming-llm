@@ -131,13 +131,16 @@ def fsdp_lora(model, dtype, r=32, alpha=1):
         parent = model.get_submodule(parent_name)
         setattr(parent, name[len(parent_name) + 1:], linear_lora)
     
-    # hacky: replace _sync_module_states func to avoid model param sync in ddp
+    # skip sync frozen params
+    # option 1 (hacky): replace _sync_params_and_buffers
+    # _sync_params_and_buffers is called by _sync_module_states in the same file (easy to replace)
+    # _sync_module_states is imported and called by ddp's init function across files (hard to replace)
     def skip(*args, **kwargs):
         if dist.get_rank() == 0:
             print("[Warning]: we skip model parameter synchronization in DDP.")
-    #torch.distributed.utils._sync_module_states = skip #to check: failed to replace the func
+    #torch.distributed.utils._sync_params_and_buffers = skip
 
-    # skip sync frozen params
+    # option 2 (suggested): use _ddp_params_and_buffers_to_ignore
     frozen_param_names = []
     for name, p in model.named_parameters():
         if not p.requires_grad:
