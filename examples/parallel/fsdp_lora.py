@@ -92,7 +92,7 @@ def naive_fsdp_lora(model, dtype, r=32, alpha=1):
     )
 
     return model
-
+ 
 
 def fsdp_lora(model, dtype, r=32, alpha=1):
     # cast frozen params for mixed-precision training
@@ -131,15 +131,28 @@ def fsdp_lora(model, dtype, r=32, alpha=1):
         parent = model.get_submodule(parent_name)
         setattr(parent, name[len(parent_name) + 1:], linear_lora)
     
+    # hacky: replace _sync_module_states func to avoid model param sync in ddp
+    def skip(*args, **kwargs):
+        if dist.get_rank() == 0:
+            print("[Warning]: we skip model parameter synchronization in DDP.")
+    #torch.distributed.utils._sync_module_states = skip #to check: failed to replace the func
+
+    # skip sync frozen params
+    frozen_param_names = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            frozen_param_names.append(name)
+    model._ddp_params_and_buffers_to_ignore = frozen_param_names
+    
     # wrap ddp
     model = DDP(
         model, 
         device_ids=[torch.cuda.current_device()], 
-        broadcast_buffers=False, # avoid broadcast frozen params
+        broadcast_buffers=False, # note that buffers (e.g., rope's inv_freq) are not equal to frozen params
         mixed_precision=mp_policy,
-        # bucket_cap_mb=25, 
+        bucket_cap_mb=25, 
     )
-    
+
     return model
     
 
