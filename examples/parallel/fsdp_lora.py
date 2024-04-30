@@ -7,7 +7,9 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.parallel.distributed import _MixedPrecision as DDPMixedPrecision
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy, lambda_auto_wrap_policy, _or_policy
 from torch.profiler import profile, ProfilerActivity
 
@@ -30,7 +32,7 @@ class LinearLoRA(nn.Module):
         self.in_features = linear.in_features
         self.out_features = linear.out_features
 
-        device, dtype = self.base.weight.device, self.base.weight.dtype
+        device, dtype = self.base.weight.device, torch.float32
         self.w_a = nn.Linear(self.in_features, r, bias=False, device=device, dtype=dtype)
         self.w_b = nn.Linear(r, self.out_features, bias=False, device=device, dtype=dtype)
 
@@ -43,7 +45,15 @@ class LinearLoRA(nn.Module):
         return self.base(hidden_states) + self.alpha * self.w_b(self.w_a(hidden_states))
 
 
-def naive_fsdp_lora(model, r=32, alpha=1):
+def naive_fsdp_lora(model, dtype, r=32, alpha=1):
+    # cast frozen params for mixed-precision training
+    assert dtype in [torch.float32, torch.float16, torch.bfloat16]
+    model.to(dtype=dtype)
+    if dtype == torch.float32:
+        mp_policy = None
+    else:
+        mp_policy = MixedPrecision(param_dtype=dtype)
+
     # freeze model
     for name, p in model.named_parameters():
         p.requires_grad = False
@@ -77,13 +87,22 @@ def naive_fsdp_lora(model, r=32, alpha=1):
     model = FSDP(
         model, 
         auto_wrap_policy=auto_wrap_policy, 
+        mixed_precision=mp_policy,
         device_id=torch.cuda.current_device(),
     )
 
     return model
 
 
-def fsdp_lora(model, r=32, alpha=1):
+def fsdp_lora(model, dtype, r=32, alpha=1):
+    # cast frozen params for mixed-precision training
+    assert dtype in [torch.float32, torch.float16, torch.bfloat16]
+    model.to(dtype=dtype)
+    if dtype == torch.float32:
+        mp_policy = None
+    else:
+        mp_policy = DDPMixedPrecision(param_dtype=dtype)
+
     # freeze model
     for name, p in model.named_parameters():
         p.requires_grad = False
@@ -117,6 +136,7 @@ def fsdp_lora(model, r=32, alpha=1):
         model, 
         device_ids=[torch.cuda.current_device()], 
         broadcast_buffers=False, # avoid broadcast frozen params
+        mixed_precision=mp_policy,
         # bucket_cap_mb=25, 
     )
     
@@ -136,14 +156,15 @@ if __name__ == "__main__":
     config.vocab_size = 1024
     config.hidden_size = 1024
 
-    model = AutoModelForCausalLM.from_config(config)
+    dtype = torch.float16
+    model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype)
 
     # wrap fsdp and lora
     # 1) naive wrap
-    #model = naive_fsdp_lora(model, r=32, alpha=1)
+    #model = naive_fsdp_lora(model, dtype=dtype, r=32, alpha=1)
 
     # 2) optimized wrap
-    model = fsdp_lora(model, r=32, alpha=1)
+    model = fsdp_lora(model, dtype=dtype, r=32, alpha=1)
 
     optimizer = optim.AdamW(
         model.parameters(), 
@@ -166,6 +187,10 @@ if __name__ == "__main__":
         optimizer.step()
         torch.cuda.synchronize()
 
+    memory_snapshot = False
+    if dist.get_rank() == 0 and memory_snapshot:
+        torch.cuda.memory._record_memory_history(max_entries=100000)
+
     # warmup
     one_step()
 
@@ -185,10 +210,16 @@ if __name__ == "__main__":
         trainable_params = []
         for param in optimizer.param_groups[0]['params']:
             if param.requires_grad:
+                assert param.dtype == torch.float32
                 trainable_params.append(param)
             else:
+                assert param.dtype == dtype
                 frozen_params.append(param)
         print(f"num of frozen params: {len(frozen_params)}, num of trainable params: {len(trainable_params)}")
+        
+        if memory_snapshot:
+            torch.cuda.memory._dump_snapshot("fsdp_lora.pickle")
+            torch.cuda.memory._record_memory_history(enabled=None)
 
         prof.export_chrome_trace("fsdp_lora.json")
         print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
