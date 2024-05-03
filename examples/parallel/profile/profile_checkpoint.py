@@ -11,9 +11,10 @@ from torch.profiler import profile, ProfilerActivity
 
 try: 
     from torch.utils.checkpoint import _pt2_selective_checkpoint_context_fn_gen
-    support_selective_checkpoint = True  #torch-2.2
+    torch_selective_checkpoint = True  #torch-2.2
 except:
-    support_selective_checkpoint = False
+    from selective_checkpoint import checkpoint as custom_checkpoint, set_no_recompute_list
+    torch_selective_checkpoint = False
 
 class MLP(nn.Module):
     def __init__(self, hidden_size, intermediate_size):
@@ -77,12 +78,15 @@ model.cuda()
 Selective Checkpoint: skip recomputing compute-heavy operations, such as mm and sdpa
 for example, we can recompute relu (swiglu) for mlp, or skip sdpa for long-context attention.
 """
+no_recompute_list = [
+    torch.ops.aten.mm.default, 
+    torch.ops.aten._scaled_dot_product_efficient_attention.default, 
+    torch.ops.aten._scaled_dot_product_flash_attention.default,
+]
+if not use_mlp:
+    no_recompute_list.pop(0)  # only skip sdpa
+
 def get_custom_policy():
-    no_recompute_list = [
-        torch.ops.aten.mm.default, 
-        torch.ops.aten._scaled_dot_product_efficient_attention.default, 
-        torch.ops.aten._scaled_dot_product_flash_attention.default,
-    ]
     def custom_policy(mode, func, *args, **kwargs):
         return func in no_recompute_list
     return custom_policy
@@ -94,12 +98,16 @@ def selective_checkpoint_context_fn():
 # wrap checkpoint: reentrant vs. non-reentrant
 # non_reentrant recompute only necessary activation inputs, 
 # for example, there is no need to recompute last gemm in mlp. 
-selective_checkpoint = False
+selective_checkpoint = True
 non_reentrant = True
 
-if selective_checkpoint and support_selective_checkpoint:
+if selective_checkpoint and torch_selective_checkpoint:
     checkpoint_wrapper_fn = partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT, context_fn=selective_checkpoint_context_fn)
     print('non-reentrant selective checkpoint')
+elif selective_checkpoint:
+    set_no_recompute_list(no_recompute_list=no_recompute_list)
+    checkpoint_wrapper_fn = partial(checkpoint_wrapper, checkpoint_fn=custom_checkpoint)
+    print('custom selective checkpoint')
 elif non_reentrant:
     checkpoint_wrapper_fn = partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
     print('non-reentrant full checkpoint')
@@ -107,13 +115,11 @@ else:
     checkpoint_wrapper_fn = partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.REENTRANT)
     print('reentrant full checkpoint')
 
-apply_activation_checkpointing(model, checkpoint_wrapper_fn=checkpoint_wrapper_fn, check_fn=check_fn)
-#print(model)
-
 # fake data
 batch_size = 1
 seq_len = 16000
-data = torch.randn(size=(batch_size, seq_len, hidden_size), requires_grad=True).cuda()
+data = torch.randn(size=(batch_size, seq_len, hidden_size)).cuda()
+data.requires_grad_()
 
 def benchmark_step():
     output = model(data)
@@ -121,8 +127,18 @@ def benchmark_step():
     loss.backward()
     torch.cuda.synchronize()
 
-# warmup
+# reference w/o checkpoint
 benchmark_step()
+grad_ref = data.grad
+data.grad = None
+
+# wrap checkpoint
+apply_activation_checkpointing(model, checkpoint_wrapper_fn=checkpoint_wrapper_fn, check_fn=check_fn)
+#print(model)
+
+# warmup w. checkpoint
+benchmark_step()
+print(f'The maximum difference is {torch.max(torch.abs(grad_ref - data.grad))}')
 
 # profile
 with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
