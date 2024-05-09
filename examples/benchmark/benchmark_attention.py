@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument("--remote_attention", action="store_true")
     parser.add_argument("--model_device", type=str, default="auto")
     parser.add_argument("--kv_cache_device", type=str, default="auto")
+    parser.add_argument("--remote_overlap", action="store_true")
 
     args = parser.parse_args()
     return args
@@ -126,7 +127,9 @@ elif args.enable_xformers:
     enable_llama_xops_attention(model)
 elif args.remote_attention:
     from remote_attention import set_remote_attention
-    set_remote_attention(model, device=args.kv_cache_device, max_seq_length=args.input+args.output)
+    if args.remote_overlap:
+        assert not args.model_device == args.kv_cache_device, 'kv cache and model devices should be different to overlap data transfer'
+    set_remote_attention(model, device=args.kv_cache_device, max_seq_length=args.input+args.output, overlap=args.remote_overlap)
 
 input_ids = torch.randint(0, vocab_size-1, (args.bs, args.input), dtype=torch.long)
 max_gen_len = args.output

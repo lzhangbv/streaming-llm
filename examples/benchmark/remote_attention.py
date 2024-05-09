@@ -18,8 +18,14 @@ def set_remote_attention(model, max_seq_length=2048, device="cuda:0", dtype=torc
     head_dim = config.hidden_size // config.num_attention_heads
     # it only supports bs=1
     cache_shape = (1, n_heads, max_seq_length, head_dim)
+    
     # overlap prefill kv cache data transfer
-    transfer_stream = torch.cuda.Stream() if overlap else None
+    if overlap:
+        send_stream = torch.cuda.Stream(model.device)
+        recv_stream = torch.cuda.Stream(device)
+        transfer_stream = {'send': send_stream, 'recv': recv_stream}
+    else:
+        transfer_stream = None
 
     for name, module in model.named_modules(): 
         if "attn" in name and "attn." not in name:
@@ -97,11 +103,22 @@ def llama_attention_forward(
     if q_len > 1:
         # prefill: compute attention locally
         if self.transfer_stream is not None:
-            # overlap with kv cache data transfer
-            self.transfer_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self.transfer_stream):
-                self.k_cache[:, :, :q_len] = key_states
-                self.v_cache[:, :, :q_len] = value_states
+            # overlap prefill computation with kv cache data transfer
+            # decouple data_transfer process (gpu0->gpu1) and mem_cpy process (gpu1)
+            self.transfer_stream['send'].wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.transfer_stream['send']), torch.cuda.stream(self.transfer_stream['recv']):
+                # async data transfer
+                remote_device = self.k_cache.device
+                remote_key_states = key_states.to(remote_device)
+                remote_value_states = value_states.to(remote_device)
+            with torch.cuda.device(remote_device):
+                # mem cpy on remote device
+                current_stream = torch.cuda.current_stream()
+                current_stream.wait_stream(self.transfer_stream['recv'])
+                self.k_cache[:, :, :q_len] = remote_key_states
+                self.v_cache[:, :, :q_len] = remote_value_states
+                remote_key_states.record_stream(current_stream)
+                remote_value_states.record_stream(current_stream)
         else:
             self.k_cache[:, :, :q_len] = key_states
             self.v_cache[:, :, :q_len] = value_states
@@ -225,8 +242,9 @@ def llama_model_forward(
     hidden_states = hidden_states[:, -1, :].unsqueeze(1)
 
     # synchronize the data transfer operations in the prefill phase
+    # tocheck: this synchronization seems unnecessary as remote_attention is on remote device's current stream like memcpy ops
     if q_len > 1 and self.transfer_stream is not None: 
-        torch.cuda.current_stream().wait_stream(self.transfer_stream)
+        torch.cuda.current_stream().wait_stream(self.transfer_stream['send'])
 
     if not return_dict:
         return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
@@ -253,7 +271,13 @@ def test(args):
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     # setup remote attention
-    set_remote_attention(model, max_seq_length=args.max_seq_length, device=args.kv_cache_device)
+    overlap = args.remote_overlap and not (args.model_device == args.kv_cache_device)
+    set_remote_attention(
+        model, 
+        max_seq_length=args.max_seq_length, 
+        device=args.kv_cache_device,
+        overlap=overlap,
+    )
 
     # prompt
     prompt = "What is deep learning?"
@@ -271,6 +295,7 @@ if __name__ == "__main__":
     parser.add_argument("--kv_cache_device", type=str, default="cuda:1")
     parser.add_argument("--max_new_tokens", type=int, default=200)
     parser.add_argument("--max_seq_length", type=int, default=2048)
+    parser.add_argument("--remote_overlap", action="store_true")
     args = parser.parse_args()
     print(args)
     test(args)
