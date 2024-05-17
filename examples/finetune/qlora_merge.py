@@ -40,6 +40,7 @@ import json
 from pathlib import Path
 
 import torch
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from bitsandbytes.functional import quantize_4bit, dequantize_4bit
 
@@ -52,16 +53,29 @@ def qlora_merge(
     bnb_4bit_use_double_quant, 
     bnb_4bit_quant_type,
     merge_alpha = 0.5,
+    **kwargs,
 ):
     assert bnb_4bit_quant_type in ['fp4', 'nf4'], f"4-bit quantization data type {bnb_4bit_quant_type} is not implemented."
     assert merge_alpha >= 0. and merge_alpha <= 1.
     
+    # skip model init
+    def skip(*args, **kwargs):
+        pass
+    old_init = (torch.nn.init.kaiming_uniform_, torch.nn.init.uniform_, torch.nn.init.normal_)
+    torch.nn.init.kaiming_uniform_, torch.nn.init.uniform_, torch.nn.init.normal_ = skip, skip, skip
+    old_init_weights = transformers.modeling_utils._init_weights
+    transformers.modeling_utils._init_weights = False
+
     # load base model
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=bnb_4bit_compute_dtype,
+        **kwargs,
     )
-    
+
+    (torch.nn.init.kaiming_uniform_, torch.nn.init.uniform_, torch.nn.init.normal_) = old_init
+    transformers.modeling_utils._init_weights = old_init_weights
+
     # load adaptor config
     adaptor_config = json.load(open(Path(adapter_path) / 'adapter_config.json'))
     assert adaptor_config['peft_type'] == 'LORA'
@@ -80,8 +94,11 @@ def qlora_merge(
     # load adaptor weight
     if (Path(adapter_path) / 'adapter_model.bin').exists():
         checkpoint = torch.load(Path(adapter_path) / 'adapter_model.bin', map_location='cpu')
+    elif (Path(adapter_path) / 'adapter_model.safetensors').exists():
+        from safetensors.torch import load_file as safe_load
+        checkpoint = safe_load(Path(adapter_path) / 'adapter_model.safetensors', device='cpu')
     else:
-        FileNotFoundError(f"Could not find adaptor checkpoint at {adapter_path}; please ensure it contains a `adapter_model.bin` file.")
+        FileNotFoundError(f"Could not find adaptor checkpoint at {adapter_path}; please ensure it contains a `adapter_model.bin` or `adapter_model.safetensors` file.")
 
     for name, module in model.named_modules():
         # assume the name pattern is something like model.layers.0.self_attn.q_proj
@@ -89,15 +106,19 @@ def qlora_merge(
             key_name = f"base_model.model.{name}.weight"
             adaptor_w = checkpoint.pop(key_name).to(dtype=bnb_4bit_compute_dtype)
             if module.weight.data.shape == adaptor_w.shape:
-                module.weight.data.copy_(adaptor_w)
+                weight = merge_alpha * adaptor_w + (1 - merge_alpha) * module.weight
+                module.weight.data.copy_(weight)
             else:
                 # shape can be different, such as expanded token embedding
-                module.weight.data = adaptor_w.to(device='cpu')
+                # todo: how to interpolate the expanded token embedding
+                if merge_alpha > 0:
+                    module.weight.data = adaptor_w.to(device='cpu')
 
             if hasattr(module, "bias") and module.bias is not None:
                 key_name = f"base_model.model.{name}.bias"
                 adaptor_b = checkpoint.pop(key_name).to(dtype=bnb_4bit_compute_dtype)
-                module.bias.data.copy_(adaptor_b)
+                bias = merge_alpha * adaptor_b + (1 - merge_alpha) *  module.bias
+                module.bias.data.copy_(bias)
 
         elif any(name.endswith(f"{target_module}") for target_module in target_modules):
             base_w = module.weight.data.to(device='cuda', dtype=bnb_4bit_compute_dtype)
@@ -139,8 +160,8 @@ def qlora_merge(
 
 if __name__ == "__main__":
     # config
-    model_path = 'huggyllama/llama-7b'
-    adapter_path = 'timdettmers/guanaco-7b'
+    model_path = 'meta-llama/Meta-Llama-3-8B-Instruct'
+    adapter_path = 'namespace-Pt/Llama-3-8B-Instruct-80K-QLoRA'
 
     # merge model and adaptor
     model = qlora_merge(
@@ -150,15 +171,34 @@ if __name__ == "__main__":
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
         merge_alpha=0.5,
+        rope_theta=200e6, # expand rope base, comment it out if merge_alpha=0
     )
 
-    # move to gpu
-    model.to(device='cuda')
+    # move to gpu(s)
+    multigpu = True
+    if multigpu:
+        from accelerate import infer_auto_device_map, dispatch_model
+        device_map = infer_auto_device_map(model, no_split_module_classes=['LlamaDecoderLayer'])
+        model = dispatch_model(model, device_map=device_map)
+    else:
+        model.to(device='cuda')
 
     # test
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    prompt = "What is deep learning?"
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    outputs = model.generate(**inputs, max_new_tokens=25)
-    print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+    
+    messages = [{"role": "user", "content": "What is deep learning?"}]
+
+    input_ids = tokenizer.apply_chat_template(
+        messages, 
+        add_generation_prompt=True, 
+        return_tensors="pt", 
+    ).to(model.device)
+
+    terminators = [tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|eot_id|>")]
+
+    outputs = model.generate(input_ids, max_new_tokens=256, eos_token_id=terminators)
+    response = outputs[0][input_ids.shape[-1]:]
+    print(tokenizer.decode(response, skip_special_tokens=True))
+
+    print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
