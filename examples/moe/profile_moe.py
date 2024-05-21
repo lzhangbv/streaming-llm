@@ -142,7 +142,7 @@ def custom_moe(hidden_states, max_prob, max_ind, weight):
 
     # permutation
     perm_ids = torch.argsort(max_ind)
-    sorted_hidden_states = torch.index_select(hidden_states, 0, perm_ids // topk)
+    sorted_hidden_states = hidden_states[perm_ids // topk] # index_select
 
     # moe computation (dummy)
     grouped_gemm = True
@@ -161,8 +161,8 @@ def custom_moe(hidden_states, max_prob, max_ind, weight):
         sorted_outputs = torch.matmul(sorted_outputs, weight.t())
 
     # unpermutation
-    unperm_ids = torch.argsort(perm_ids)
-    outputs = torch.index_select(sorted_outputs, 0, unperm_ids)
+    outputs = torch.empty_like(sorted_outputs)
+    outputs[perm_ids] = sorted_outputs
 
     # weighted sum
     outputs *= max_prob.view(-1, 1)
@@ -183,9 +183,9 @@ if __name__ == "__main__":
     max_prob = torch.softmax(max_logit, dim=-1)
 
     # warmup
-    outputs = mixtral_moe(hidden_states, max_prob, max_ind, weight)
+    #outputs = mixtral_moe(hidden_states, max_prob, max_ind, weight)
     #outputs = megatron_moe_with_ep(hidden_states, max_prob, max_ind, weight)
-    #outputs = custom_moe(hidden_states, max_prob, max_ind, weight)
+    outputs = custom_moe(hidden_states, max_prob, max_ind, weight)
     
     #from tutel.impls.fast_dispatch import fast_decode, fast_encode, extract_critical
     #outputs = tutel_moe(hidden_states, logits, weight, cf=1.2)
@@ -195,9 +195,9 @@ if __name__ == "__main__":
         for i in range(10):
             torch.matmul(hidden_states, weight_dummy)
 
-        outputs = mixtral_moe(hidden_states, max_prob, max_ind, weight)
+        #outputs = mixtral_moe(hidden_states, max_prob, max_ind, weight)
         #outputs = megatron_moe_with_ep(hidden_states, max_prob, max_ind, weight)
-        #outputs = custom_moe(hidden_states, max_prob, max_ind, weight)
+        outputs = custom_moe(hidden_states, max_prob, max_ind, weight)
         #outputs = tutel_moe(hidden_states, logits, weight, cf=1.2)
 
     prof.export_chrome_trace("trace.json")
