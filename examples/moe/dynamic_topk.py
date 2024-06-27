@@ -6,6 +6,7 @@ import types
 
 # small threshold gives more top1 routing and worse performance
 THRESHOLD = 0.3
+NORM_TOPK = False
 
 def dynamic_topk_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     """ """
@@ -19,9 +20,16 @@ def dynamic_topk_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
 
     # top1 mask: set the 2rd expert weight to 0
     top1_mask = routing_weights[:,0] - routing_weights[:,1] > THRESHOLD
-    routing_weights[top1_mask, 1] = 0
+
+    if NORM_TOPK:
+        #1) set_zero and normalize
+        routing_weights[top1_mask, 1] = 0
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    else:
+        #2) normalize and set_zero
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights[top1_mask, 1] = 0
     
-    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
     # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)
 
@@ -61,9 +69,12 @@ def dynamic_topk_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
     return final_hidden_states, router_logits
 
-def enable_dynamic_topk(model, threshold=0.3):
+def enable_dynamic_topk(model, threshold=0.3, norm_after_prune=False):
     global THRESHOLD
     THRESHOLD = threshold
+    global NORM_TOPK
+    NORM_TOPK = norm_after_prune
+
     for name, module in model.named_modules():
         if "block_sparse_moe" in name and "block_sparse_moe." not in name:
             module.forward = types.MethodType(dynamic_topk_forward, module)
