@@ -7,32 +7,44 @@ from typing import List, Optional, Tuple
 
 import torch
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 
 
 class SwapAttention:
-    def __init__(self, stream):
+    def __init__(self, stream, limit=None):
         self.gpu_tensor_list = []
         self.cpu_tensor_list = []
         self.transfer_stream = stream
+
+        self.current_gpu_tensors = []
+        self.current_cpu_tensors = []
+        self.limit = limit  # max number of tensors to offload
     
-    def offload(self, gpu_tensors):
-        cpu_tensors = [None] * len(gpu_tensors)
-        self.gpu_tensor_list.append(gpu_tensors)
-        self.cpu_tensor_list.append(cpu_tensors)
-        
+    def offload(self, gpu_tensor):
+        # add tensor to current tensors
+        if self.limit is not None and len(self.current_gpu_tensors) >= self.limit:
+            return
+        self.current_gpu_tensors.append(gpu_tensor)
+        self.current_cpu_tensors.append(None)
+
         #print("----start offload----") 
         # offload activations from gpu to cpu
         self.transfer_stream.wait_stream(torch.cuda.current_stream())
         with torch.no_grad():
-            for i in range(len(gpu_tensors)):
-                with torch.cuda.stream(self.transfer_stream):
-                    cpu_tensors[i] = gpu_tensors[i].to('cpu', non_blocking=True)
+            with torch.cuda.stream(self.transfer_stream):
+                self.current_cpu_tensors[-1] = gpu_tensor.to('cpu', non_blocking=True)
     
     def wait(self):
         # synchronize offload operations
         torch.cuda.current_stream().wait_stream(self.transfer_stream)
         #print("----finish offload----")
+
+        # add current tensors to list
+        self.gpu_tensor_list.append(self.current_gpu_tensors)
+        self.cpu_tensor_list.append(self.current_cpu_tensors)
+        self.current_gpu_tensors = []
+        self.current_cpu_tensors = []
 
         # release gpu memory
         gpu_tensors = self.gpu_tensor_list[-1]
@@ -79,16 +91,16 @@ def decoder_layer_forward(
     """
     It is based on modeling_llama from huggingface transformers. 
     Logic:
-    - Forward: Attention, offload, register_finish_reload, FFN, wait, resigter_start_reload
-    - Backward: Attention_BWD,     finish_reload,        , FFN_BWD  , start_reload
+    - Forward: Attention, offload, register_finish_reload, FFN, wait, resigter_start_reload  -->
+    - Backward: Attention_BWD,     finish_reload,        , FFN_BWD  , start_reload           <--
     """
 
-    gpu_tensors = [hidden_states]
+    self.swap.offload(hidden_states)
 
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
 
-    gpu_tensors.append(hidden_states)
+    self.swap.offload(hidden_states)
 
     bsz, q_len, _ = hidden_states.size()
     query_states = self.self_attn.q_proj(hidden_states)
@@ -111,7 +123,9 @@ def decoder_layer_forward(
     key_states = repeat_kv(key_states, self.self_attn.num_key_value_groups)
     value_states = repeat_kv(value_states, self.self_attn.num_key_value_groups)
 
-    gpu_tensors.extend([query_states, key_states, value_states])
+    self.swap.offload(query_states)
+    self.swap.offload(key_states)
+    self.swap.offload(value_states)
 
     attn_output = F.scaled_dot_product_attention(
         query_states,
@@ -122,7 +136,7 @@ def decoder_layer_forward(
         is_causal=True,
     )
 
-    gpu_tensors.append(attn_output)
+    self.swap.offload(attn_output)
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(hidden_states.shape)
@@ -130,7 +144,6 @@ def decoder_layer_forward(
     attn_output = self.self_attn.o_proj(attn_output)
     hidden_states = residual + attn_output
 
-    self.swap.offload(gpu_tensors)
     self.swap.register_finish_reload(hidden_states)
 
     residual = hidden_states
@@ -152,11 +165,28 @@ def decoder_layer_forward(
     return outputs
 
 
-def enable_swap(model):
+def gelu_recompute_forward(self, x):
+    """
+    mlp forward with gelu recomputation
+    """
+    def func(up, gate):
+        return self.down_proj(self.act_fn(gate) * up)
+
+    up = self.up_proj(x)
+    gate = self.gate_proj(x)
+    down = checkpoint(func, up, gate, use_reentrant=False)
+    return down
+
+
+def enable_swap(model, limit=None, gelu_recompute=True):
     transfer_stream = torch.cuda.Stream()
+
     for layer in model.model.layers:
-        layer.swap = SwapAttention(transfer_stream)
+        layer.swap = SwapAttention(transfer_stream, limit)
         layer.forward = types.MethodType(decoder_layer_forward, layer)
+
+        if gelu_recompute:
+            layer.mlp.forward = types.MethodType(gelu_recompute_forward, layer.mlp)
 
 
 def test(model):
@@ -186,9 +216,14 @@ def test(model):
     print(f"The maximum difference of gradient is {torch.max(torch.abs(embeds.grad - embeds_ref.grad))}")
 
 
-def benchmark(model, profile=False):
+def benchmark(model, swap=True, profile=False):
+    if swap:
+        enable_swap(model, limit=None, gelu_recompute=True)
+    else:
+        enable_swap(model, limit=0, gelu_recompute=False)
+
     # inputs
-    batch_size, seq_len = 1, 4096
+    batch_size, seq_len = 4, 4096
     x = torch.randint(low=0, high=1024, size=(batch_size, seq_len), device='cuda')
 
     def benchmark_step():
@@ -218,7 +253,7 @@ if __name__ == "__main__":
     
     model_id = "lmsys/vicuna-7b-v1.3"
     config = AutoConfig.from_pretrained(model_id)
-    config.num_hidden_layers = 2
+    config.num_hidden_layers = 8
     config.use_cache = False
 
     model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16)
@@ -226,5 +261,5 @@ if __name__ == "__main__":
 
     #test(model)
 
-    benchmark(model, profile=True)
+    benchmark(model, swap=True, profile=False)
 
