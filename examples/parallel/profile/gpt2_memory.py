@@ -14,7 +14,7 @@ class TrackingMode(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args, kwargs=None):
         res = func(*args, **kwargs or {})
         if debug:
-            print('operation:', func)
+            print('operation:', func, ', allocated memory:', torch.cuda.memory_allocated())
         return res
 
 
@@ -32,7 +32,8 @@ class ActivationMode(torch.autograd.graph.saved_tensors_hooks):
                         print('saved activation:', x.dtype, x.shape, x.element_size()*x.numel(), x_.size(), name)
                     activation_dict[name] = x_.size()
                 else:
-                    #print('duplicated activation:', x.dtype, x.shape, x.element_size()*x.numel(), x_.size())
+                    #if debug:
+                    #    print('duplicated activation:', x.dtype, x.shape, x.element_size()*x.numel(), x_.size())
                     pass
 
             return x
@@ -65,7 +66,7 @@ def count_parameter(model):
     return count
 
 
-def profile_model(name='gpt2', mode='autocast'):
+def profile_model(name='gpt2', mode='autocast', peak_memory=True):
     config = get_config(name)
     model = GPT2LMHeadModel(config)
     print("Model:", name)
@@ -84,7 +85,6 @@ def profile_model(name='gpt2', mode='autocast'):
     model.to(device='cuda', dtype=dtype)
     mem_1 = torch.cuda.memory_allocated()
     print("Num of parameters:", count_parameter(model))
-    print("Load model:", mem_1)
 
     # add buffer tensors for deduplication
     global activation_dict
@@ -109,9 +109,10 @@ def profile_model(name='gpt2', mode='autocast'):
         with TrackingMode(), ActivationMode():
             outputs = model(input_ids=x, labels=x)
             loss = outputs.loss
-
+    
     del outputs  # delete outputs
     mem_2 = torch.cuda.memory_allocated()
+    print("\nLoad model:", mem_1)
     print("Forward:", mem_2)
 
     loss.backward()
@@ -124,10 +125,9 @@ def profile_model(name='gpt2', mode='autocast'):
 
     mem_4 = torch.cuda.memory_allocated()
     print("Update:", mem_4)
-    # print("Peak:", torch.cuda.max_memory_allocated())
 
     # report activation memory
-    print("Delta-mode activations:", mem_2 - mem_1)
+    print("\nDelta-mode activations:", mem_2 - mem_1)
 
     # add activation memory
     curr_use = 0
@@ -139,6 +139,65 @@ def profile_model(name='gpt2', mode='autocast'):
 
     # estimate activation memory
     print("Estimated activations:", estimate_model_activation_memory(config, mode))
+
+    # report peak memory
+    if peak_memory:
+        # for first iteration
+        #print("\nFirst-iteration peak memory:", torch.cuda.max_memory_allocated())
+        #print("Estimated first-iteration peak memory:", estimate_peak_memory(config, mode, first_iteration=True))
+
+        # for second iteration
+        if mixed_precision:
+            with torch.autocast(dtype=torch.float16, device_type='cuda'):
+                outputs = model(input_ids=x, labels=x)
+                loss = outputs.loss
+        else:
+            outputs = model(input_ids=x, labels=x)
+            loss = outputs.loss
+        del outputs
+        
+        loss.backward()
+        
+        optimizer.step()
+        optimizer.zero_grad()
+
+        print("\nPeak memory:", torch.cuda.max_memory_allocated())
+        print("Estimated peak memory:", estimate_peak_memory(config, mode))
+
+
+def estimate_peak_memory(config, mode='autocast', first_iteration=False):
+    b = config.batch_size
+    s = config.sequence_length
+    d = config.n_embd
+    vocab_size = config.vocab_size
+    n_layer = config.n_layer
+    n_ctx = config.n_positions
+
+    # model and optimizer states
+    n_param = 12 * d * d * n_layer + d * (vocab_size + n_ctx)
+    if mode == 'fp16':
+        cost = n_param * 2 if first_iteration else n_param * 6  # first iteration did not count adam states
+    else:
+        cost = n_param * 4 if first_iteration else n_param * 12
+
+    # forward activations
+    cost += estimate_model_activation_memory(config, mode)
+
+    # workspace memory for loss function (fwd+bwd), note that fused_xentropy helps here
+    if mode == 'fp32':
+        cost += 2 * 4 * b * (s-1) * vocab_size
+    elif mode == 'fp16':
+        cost += 2 * 2 * b * (s-1) * vocab_size
+    elif mode == 'autocast':
+        cost += 2 * 2 * b * (s-1) * vocab_size
+
+    # peak memory may happen during optimizer-update (weight, grad, adam states, update workspace), note that fused_adam helps here
+    if mode == 'fp16':
+        update_cost = n_param * 2 * 5
+    else:
+        update_cost = n_param * 4 * 5
+
+    return max(cost, update_cost)
 
 
 def estimate_model_activation_memory(config, mode='autocast'):
@@ -163,12 +222,16 @@ def estimate_model_activation_memory(config, mode='autocast'):
     return cost
 
 
-def estimate_layer_activation_memory(config, mode='autocast'):
+def estimate_layer_activation_memory(config, mode='autocast', eager_attn=True):
     b = config.batch_size
     s = config.sequence_length
     d = config.n_embd
     h = config.n_head
     gelu_new = (config.activation_function == 'gelu_new')
+
+    if not eager_attn: 
+        # flash-attention and sdpa did not include the item of b * h * s * s
+        h = 0
 
     if mode == 'fp32':
         if gelu_new:
